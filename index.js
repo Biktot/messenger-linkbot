@@ -12,22 +12,36 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const lastSubjectBySender = {};
 const lastProjectBySender = {};
 
+// ---------- CONVERSATION MEMORY ----------
+// Keeps last few exchanges per person so the AI has context. Resets on server restart.
+const conversationHistory = {};
+const MAX_HISTORY_MESSAGES = 10; // 5 user + 5 bot turns
+
+function addToHistory(senderId, role, content) {
+  if (!conversationHistory[senderId]) conversationHistory[senderId] = [];
+  conversationHistory[senderId].push({ role, content });
+  if (conversationHistory[senderId].length > MAX_HISTORY_MESSAGES) {
+    conversationHistory[senderId] = conversationHistory[senderId].slice(-MAX_HISTORY_MESSAGES);
+  }
+}
+
+function getHistory(senderId) {
+  return conversationHistory[senderId] || [];
+}
+
 // ---------- GROQ HELPERS ----------
 
-async function askGroq(systemPrompt, userMessage) {
+async function askGroq(systemPrompt, userMessage, history = []) {
   if (!GROQ_API_KEY) return null;
   try {
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      ...history,
+      { role: 'user', content: userMessage },
+    ];
     const response = await axios.post(
       'https://api.groq.com/openai/v1/chat/completions',
-      {
-        model: 'llama-3.3-70b-versatile',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userMessage },
-        ],
-        max_tokens: 300,
-        temperature: 0.5,
-      },
+      { model: 'llama-3.3-70b-versatile', messages, max_tokens: 300, temperature: 0.5 },
       { headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' } }
     );
     return response.data.choices?.[0]?.message?.content?.trim() || null;
@@ -80,9 +94,10 @@ async function checkSimilar(existingUrls, newUrl) {
   return raw?.trim().toUpperCase() === 'YES';
 }
 
-async function interpretNaturalLanguage(text) {
+async function interpretNaturalLanguage(text, senderId) {
+  const history = getHistory(senderId);
   const raw = await askGroq(
-    `You control a bot with these real features: (1) reviewer links organized by subject, (2) project links organized by project name, (3) a daily class schedule notifier that messages the user each morning and when a class period starts. Map the message to ONE action as JSON only, no extra text:
+    `You control a bot with these real features: (1) reviewer links by subject, (2) project links by project name, (3) a daily class schedule (stored per weekday) that you can check on request, plus automatic morning/class-start notifications, (4) a quiz generator. Map the message to ONE action as JSON only, no extra text. Use conversation history for context (e.g. "yes" replying to a previous question).
 {"action":"list_links","subject":"<subject>"}
 {"action":"list_subjects"}
 {"action":"list_all"}
@@ -93,9 +108,11 @@ async function interpretNaturalLanguage(text) {
 {"action":"list_project","project":"<project name>"}
 {"action":"list_projects"}
 {"action":"add_project","project":"<project name>","url":"<url>"}
+{"action":"check_schedule","when":"today or tomorrow"}
 {"action":"chat"}
-Use "chat" for casual conversation, questions about the bot's features, or anything else.`,
-    text
+Use "chat" for casual conversation, questions about features, or anything else.`,
+    text,
+    history
   );
   try {
     return JSON.parse((raw || '').replace(/```json|```/g, '').trim());
@@ -113,18 +130,20 @@ async function generateQuiz(subject) {
 }
 
 const BOT_FEATURES_DESCRIPTION = `
-Real features you actually have (only mention these, don't make anything else up):
-1. Reviewer link organizer — save study reviewer links by subject (e.g. "reviewer anaphy <link>"), list them, search, remove.
-2. Project link organizer — save project-related links separately by project name (e.g. "project thesis <link>" or "pr thesis <link>"), list them per project.
-3. Daily class schedule notifier — every morning around 6 AM it messages with the first class of the day, and pings again whenever a new class period starts, based on a saved weekly schedule.
-4. Quiz generator — "quiz <subject>" generates a few practice questions on a topic.
-5. You can also just chat normally for casual conversation or questions.
+Real features you actually have (only mention these, don't invent others):
+1. Reviewer link organizer — save study reviewer links by subject.
+2. Project link organizer — save project-related links by project name (say "project <name> <link>").
+3. Daily class schedule — you can check today's or tomorrow's classes on request, plus automatic morning alerts and class-start pings.
+4. Quiz generator — "quiz <subject>" for practice questions.
+5. Normal conversation — you remember recent messages in this chat.
 `;
 
-async function chatReply(text) {
+async function chatReply(text, senderId) {
+  const history = getHistory(senderId);
   const raw = await askGroq(
-    `You are a friendly, helpful assistant chatting with a Philippine BSN nursing student inside Messenger. Keep replies short (2-4 sentences), warm, conversational. ${BOT_FEATURES_DESCRIPTION} If asked what you can do, summarize ONLY these real features, don't invent others.`,
-    text
+    `You are a friendly, helpful assistant chatting with a Philippine BSN nursing student inside Messenger. Keep replies short (2-4 sentences), warm, conversational. Use the conversation history for context — don't ask things already answered. ${BOT_FEATURES_DESCRIPTION}`,
+    text,
+    history
   );
   return raw || "Sorry, I'm having trouble responding right now.";
 }
@@ -145,6 +164,26 @@ function getTimeString(phDate) {
   const h = String(phDate.getUTCHours()).padStart(2, '0');
   const m = String(phDate.getUTCMinutes()).padStart(2, '0');
   return `${h}:${m}`;
+}
+
+async function checkScheduleFor(when) {
+  const phTime = getPHTime();
+  const targetDate = new Date(phTime);
+  if (when === 'tomorrow') targetDate.setUTCDate(targetDate.getUTCDate() + 1);
+
+  const day = getDayCode(targetDate);
+  if (day === 'MON' || day === 'SUN') return `No classes ${when} (${day === 'MON' ? 'No pasok' : 'Sunday'}).`;
+
+  const { data, error } = await supabase
+    .from('schedule')
+    .select('subject, start_time, end_time')
+    .eq('day', day)
+    .order('start_time', { ascending: true });
+
+  if (error || !data || data.length === 0) return `No classes scheduled ${when}.`;
+
+  const list = data.map(p => `• ${p.subject} (${p.start_time}–${p.end_time})`).join('\n');
+  return `📅 Schedule for ${when} (${day}):\n${list}`;
 }
 
 async function addRecipient(psid) {
@@ -477,12 +516,16 @@ function sendHelp(senderId) {
 - project <name> — view links for that project
 - projects — list all project names
 - allprojects — view everything
+- removeproject <name> <number>
+
+📅 SCHEDULE:
+- Ask "what's my schedule today/tomorrow" anytime
+- Automatic morning + class-start alerts
 
 📝 OTHER:
 - quiz <subject> — practice questions
 - help — this menu
-- Daily class schedule alerts (automatic, no command needed)
-- Or just chat with me normally!`;
+- Or just chat with me normally — I remember our recent conversation!`;
   return sendMessage(senderId, helpText);
 }
 
@@ -495,7 +538,13 @@ async function handleMessage(text, senderId) {
   const lower = trimmed.toLowerCase();
   const words = trimmed.split(/\s+/);
 
-  if (lower === 'help' || lower === '/help') return sendHelp(senderId);
+  addToHistory(senderId, 'user', trimmed);
+
+  async function reply(fn) {
+    await fn();
+  }
+
+  if (lower === 'help' || lower === '/help') { addToHistory(senderId, 'assistant', '[sent help menu]'); return sendHelp(senderId); }
   if (lower === 'reviewers' || lower === '/reviewers') return listAllReviewers(senderId);
   if (lower === 'recent' || lower === '/recent') return listRecent(senderId);
   if (lower === 'projects') return listProjectNames(senderId);
@@ -523,7 +572,6 @@ async function handleMessage(text, senderId) {
     return sendMessage(senderId, `📝 Quick practice — ${subject.toUpperCase()}:\n${quiz}`);
   }
 
-  // ---- PROJECT COMMANDS: project / pr / proj ----
   if (lower.startsWith('project ') || lower.startsWith('pr ') || lower.startsWith('proj ')) {
     const projectName = words[1]?.toLowerCase();
     const url = words[2];
@@ -555,7 +603,6 @@ async function handleMessage(text, senderId) {
   if (lower.startsWith('/subjects')) return listSubjects(senderId);
   if (lower === 'links' || lower === 'subjects') return listSubjects(senderId);
 
-  // ---- REMOVE: handles both reviewer and project removal ----
   if (lower.startsWith('removeproject ')) {
     const restWords = words.slice(1);
     if (restWords.length >= 2 && !isNaN(parseInt(restWords[1], 10))) {
@@ -604,44 +651,57 @@ async function handleMessage(text, senderId) {
     return addLink(senderId, subject, url, { summary, autoSummarize: false });
   }
 
-  // Natural language fallback (chat-aware of real features)
   if (GROQ_API_KEY) {
-    const parsed = await interpretNaturalLanguage(trimmed);
+    const parsed = await interpretNaturalLanguage(trimmed, senderId);
+    let handled = true;
     switch (parsed.action) {
       case 'list_links':
-        if (parsed.subject) return listSubjectLinks(senderId, parsed.subject.toLowerCase());
+        if (parsed.subject) { await listSubjectLinks(senderId, parsed.subject.toLowerCase()); } else handled = false;
         break;
       case 'list_subjects':
-        return listSubjects(senderId);
+        await listSubjects(senderId);
+        break;
       case 'list_all':
-        return listAllReviewers(senderId);
+        await listAllReviewers(senderId);
+        break;
       case 'list_recent':
-        return listRecent(senderId);
+        await listRecent(senderId);
+        break;
       case 'find':
-        if (parsed.keyword) return findLinks(senderId, parsed.keyword);
+        if (parsed.keyword) { await findLinks(senderId, parsed.keyword); } else handled = false;
         break;
       case 'remove': {
         const subj = parsed.subject?.toLowerCase() || lastSubjectBySender[senderId];
-        if (subj && parsed.number) return removeByNumber(senderId, subj, parsed.number);
+        if (subj && parsed.number) { await removeByNumber(senderId, subj, parsed.number); } else handled = false;
         break;
       }
       case 'add':
-        if (parsed.subject && parsed.url) return addLink(senderId, parsed.subject.toLowerCase(), parsed.url);
+        if (parsed.subject && parsed.url) { await addLink(senderId, parsed.subject.toLowerCase(), parsed.url); } else handled = false;
         break;
       case 'list_project':
-        if (parsed.project) return listProjectLinks(senderId, parsed.project.toLowerCase());
+        if (parsed.project) { await listProjectLinks(senderId, parsed.project.toLowerCase()); } else handled = false;
         break;
       case 'list_projects':
-        return listProjectNames(senderId);
-      case 'add_project':
-        if (parsed.project && parsed.url) return addProjectLink(senderId, parsed.project.toLowerCase(), parsed.url);
+        await listProjectNames(senderId);
         break;
+      case 'add_project':
+        if (parsed.project && parsed.url) { await addProjectLink(senderId, parsed.project.toLowerCase(), parsed.url); } else handled = false;
+        break;
+      case 'check_schedule': {
+        const scheduleReply = await checkScheduleFor(parsed.when === 'tomorrow' ? 'tomorrow' : 'today');
+        addToHistory(senderId, 'assistant', scheduleReply);
+        await sendMessage(senderId, scheduleReply);
+        break;
+      }
       case 'chat':
       default: {
-        const reply = await chatReply(trimmed);
-        return sendMessage(senderId, reply);
+        const chatText = await chatReply(trimmed, senderId);
+        addToHistory(senderId, 'assistant', chatText);
+        await sendMessage(senderId, chatText);
+        break;
       }
     }
+    if (handled) return;
   }
 
   return sendMessage(senderId, `❓ Type "help" to see what I can do.`);
