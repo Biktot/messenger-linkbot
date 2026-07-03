@@ -4,7 +4,7 @@ const app = express();
 app.use(express.json());
 
 const VERIFY_TOKEN = "linkbot"; // change this to your own random string
-const PAGE_ACCESS_TOKEN = "EAAYUBmeRSi4BR7IBBbfsTlSzsEiZB39ggkA5ZBSkmvxjxhqtbVBiXiwcEOIaCFO2PPlSs0ZBBOeVzIFkzmm0ljgWGiu69ZBLhVZBUZB3xk4uGVn4AB9i4LTa6UB6XOvFgm6LNzPhZAtT1a6gE0Q7hDZB3TDgM9nr7iHwOzex1e8ETvaTHBAZAlbK5qtMj3E4Ic1qSmHcDxS6rRC2qr9kV30K7ghWqomuZCctmF3gCIzgAgFLIZD";
+const PAGE_ACCESS_TOKEN = "EAAYUBmeRSi4BR3X2sLFhKzH33J21SO9UcdDocPdfk3MJpLBM5T8VCrZCHCE4scXYYZAfubRmLZAI900qD2tOozRoLTwZAykPx9Pd5e33HV4R4WSwgBqERECBFgblzqpIFxf5edRf6oOKo3a9ZAiuWm4FD2PG7yCLNU82kSnM0cxvcNnhAdnzETRBdOdYJmY9tkcN0P88crAZBdh4cDtgT8Mh3mWZBdwY6kEZCk5SLwEZD";
 
 // In-memory storage: { subject: [ { url, date } ] }
 const links = {};
