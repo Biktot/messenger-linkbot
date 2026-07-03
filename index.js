@@ -10,7 +10,6 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 const lastSubjectBySender = {};
-const KNOWN_SUBJECTS = ['anaphy', 'biochem', 'nstp', 'tfn', 'philippine history'];
 
 // ---------- GROQ HELPERS ----------
 
@@ -26,14 +25,9 @@ async function askGroq(systemPrompt, userMessage) {
           { role: 'user', content: userMessage },
         ],
         max_tokens: 300,
-        temperature: 0.3,
+        temperature: 0.5,
       },
-      {
-        headers: {
-          Authorization: `Bearer ${GROQ_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-      }
+      { headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' } }
     );
     return response.data.choices?.[0]?.message?.content?.trim() || null;
   } catch (err) {
@@ -55,7 +49,7 @@ async function fetchPageTitle(url) {
 async function guessSubjectAndSummary(url) {
   const title = await fetchPageTitle(url);
   const raw = await askGroq(
-    `You sort study reviewer links for a Philippine nursing student. Known subjects: ${KNOWN_SUBJECTS.join(', ')}. If it clearly matches one, use it; otherwise invent a short one-word lowercase tag. Respond with ONLY:\nSUBJECT: <tag>\nSUMMARY: <one short sentence, max 15 words>`,
+    `You sort study reviewer links for a Philippine nursing student. Known subjects: anaphy, biochem, nstp, tfn, philippine history. If it clearly matches one, use it; otherwise invent a short one-word lowercase tag. Respond with ONLY:\nSUBJECT: <tag>\nSUMMARY: <one short sentence, max 15 words>`,
     `URL: ${url}\nPage title: ${title || '(unknown)'}`
   );
   if (!raw) return { subject: 'misc', summary: '' };
@@ -95,14 +89,14 @@ async function interpretNaturalLanguage(text) {
 {"action":"remove","subject":"<subject or null>","number":<number>}
 {"action":"add","subject":"<subject>","url":"<url>"}
 {"action":"find","keyword":"<keyword>"}
-{"action":"unknown"}
-Use "unknown" if unrelated to managing reviewer links.`,
+{"action":"chat"}
+Use "chat" if the message is casual conversation, a question, or anything not about managing reviewer links.`,
     text
   );
   try {
     return JSON.parse((raw || '').replace(/```json|```/g, '').trim());
   } catch {
-    return { action: 'unknown' };
+    return { action: 'chat' };
   }
 }
 
@@ -112,6 +106,50 @@ async function generateQuiz(subject) {
     `Topic: ${subject}`
   );
   return raw || 'Could not generate quiz questions right now.';
+}
+
+async function chatReply(text) {
+  const raw = await askGroq(
+    `You are a friendly, helpful assistant chatting with a Philippine BSN nursing student inside Messenger. Keep replies short (2-4 sentences max), warm, and conversational — like texting a helpful friend. You can casually mention you also manage their study reviewer links if it fits naturally, but don't force it every time.`,
+    text
+  );
+  return raw || "Sorry, I'm having trouble responding right now.";
+}
+
+// ---------- SCHEDULE HELPERS ----------
+
+function getPHTime() {
+  const now = new Date();
+  return new Date(now.getTime() + 8 * 60 * 60 * 1000);
+}
+
+function getDayCode(phDate) {
+  const days = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
+  return days[phDate.getUTCDay()];
+}
+
+function getTimeString(phDate) {
+  const h = String(phDate.getUTCHours()).padStart(2, '0');
+  const m = String(phDate.getUTCMinutes()).padStart(2, '0');
+  return `${h}:${m}`;
+}
+
+async function getRecipientPSID() {
+  const { data } = await supabase.from('bot_state').select('value').eq('key', 'recipient_psid').maybeSingle();
+  return data?.value || null;
+}
+
+async function setRecipientPSID(psid) {
+  await supabase.from('bot_state').upsert({ key: 'recipient_psid', value: psid });
+}
+
+async function getLastNotifiedPeriod() {
+  const { data } = await supabase.from('bot_state').select('value').eq('key', 'last_notified_period').maybeSingle();
+  return data?.value || null;
+}
+
+async function setLastNotifiedPeriod(periodKey) {
+  await supabase.from('bot_state').upsert({ key: 'last_notified_period', value: periodKey });
 }
 
 // ---------- WEBHOOK ----------
@@ -140,6 +178,81 @@ app.post('/webhook', async (req, res) => {
   res.status(200).send('EVENT_RECEIVED');
 });
 
+// ---------- CRON ENDPOINTS ----------
+
+app.get('/cron/morning-brief', async (req, res) => {
+  try {
+    const phTime = getPHTime();
+    const day = getDayCode(phTime);
+    const psid = await getRecipientPSID();
+    if (!psid) return res.status(200).send('No recipient set yet.');
+
+    if (day === 'MON' || day === 'SUN') {
+      await sendMessage(psid, `☀️ Good morning! No classes today. Rest well!`);
+      return res.status(200).send('Sent: no class day.');
+    }
+
+    const { data, error } = await supabase
+      .from('schedule')
+      .select('subject, start_time, end_time')
+      .eq('day', day)
+      .order('start_time', { ascending: true })
+      .limit(1);
+
+    if (error || !data || data.length === 0) {
+      await sendMessage(psid, `☀️ Good morning! No classes scheduled today.`);
+      return res.status(200).send('Sent: no classes.');
+    }
+
+    const first = data[0];
+    await sendMessage(psid, `☀️ Good morning! Your first class today is ${first.subject} at ${first.start_time}.`);
+    res.status(200).send('Sent.');
+  } catch (err) {
+    console.error('Morning brief error:', err);
+    res.status(500).send('Error');
+  }
+});
+
+app.get('/cron/check-schedule', async (req, res) => {
+  try {
+    const phTime = getPHTime();
+    const day = getDayCode(phTime);
+    const currentTime = getTimeString(phTime);
+    const psid = await getRecipientPSID();
+    if (!psid) return res.status(200).send('No recipient set yet.');
+    if (day === 'MON' || day === 'SUN') return res.status(200).send('No class day.');
+
+    const { data, error } = await supabase
+      .from('schedule')
+      .select('subject, start_time, end_time')
+      .eq('day', day)
+      .order('start_time', { ascending: true });
+
+    if (error || !data) return res.status(200).send('No schedule.');
+
+    const nowMinutes = parseInt(currentTime.split(':')[0]) * 60 + parseInt(currentTime.split(':')[1]);
+
+    for (const period of data) {
+      const [sh, sm] = period.start_time.split(':').map(Number);
+      const startMinutes = sh * 60 + sm;
+      const diff = nowMinutes - startMinutes;
+
+      if (diff >= 0 && diff < 15) {
+        const periodKey = `${day}-${period.start_time}`;
+        const lastNotified = await getLastNotifiedPeriod();
+        if (lastNotified !== periodKey) {
+          await sendMessage(psid, `📚 ${period.subject} is starting now (${period.start_time} - ${period.end_time}).`);
+          await setLastNotifiedPeriod(periodKey);
+        }
+      }
+    }
+    res.status(200).send('Checked.');
+  } catch (err) {
+    console.error('Check-schedule error:', err);
+    res.status(500).send('Error');
+  }
+});
+
 // ---------- HELPERS ----------
 
 function formatDate(isoString) {
@@ -157,31 +270,18 @@ async function listSubjectLinks(senderId, subjectRaw) {
     .eq('subject', subject)
     .order('created_at', { ascending: true });
 
-  if (error) {
-    console.error('List error:', error);
-    return sendMessage(senderId, "Error fetching links.");
-  }
+  if (error) { console.error('List error:', error); return sendMessage(senderId, "Error fetching links."); }
   if (!data || data.length === 0) return sendMessage(senderId, `No links found for "${subject}" yet.`);
 
   lastSubjectBySender[senderId] = subject;
-  const list = data.map((l, i) =>
-    `${i + 1}. ${l.url} (${formatDate(l.created_at)})${l.summary ? `\n   — ${l.summary}` : ''}`
-  ).join('\n');
+  const list = data.map((l, i) => `${i + 1}. ${l.url} (${formatDate(l.created_at)})${l.summary ? `\n   — ${l.summary}` : ''}`).join('\n');
   return sendMessage(senderId, `📚 ${subject.toUpperCase()} reviewers:\n${list}`);
 }
 
 async function addLink(senderId, subjectRaw, url, opts = {}) {
   const subject = subjectRaw.toLowerCase();
-
-  const { data: existingRows, error: fetchError } = await supabase
-    .from('links')
-    .select('id, url')
-    .eq('subject', subject);
-
-  if (fetchError) {
-    console.error('Fetch existing error:', fetchError);
-    return sendMessage(senderId, "Error checking existing links.");
-  }
+  const { data: existingRows, error: fetchError } = await supabase.from('links').select('id, url').eq('subject', subject);
+  if (fetchError) { console.error('Fetch existing error:', fetchError); return sendMessage(senderId, "Error checking existing links."); }
 
   const exactDupe = existingRows?.find(r => r.url === url);
   if (exactDupe) {
@@ -194,74 +294,42 @@ async function addLink(senderId, subjectRaw, url, opts = {}) {
     summary = await summarizeUrl(url);
   }
 
+  let similarWarning = '';
   if (GROQ_API_KEY && existingRows && existingRows.length > 0 && opts.skipSimilarCheck !== true) {
     const isSimilar = await checkSimilar(subject, url, existingRows.map(r => r.url));
-    if (isSimilar) {
-      const { error } = await supabase.from('links').insert({ subject, url, summary });
-      if (error) {
-        console.error('Addlink error:', error);
-        return sendMessage(senderId, "Error saving link.");
-      }
-      lastSubjectBySender[senderId] = subject;
-      return sendMessage(senderId, `✅ Added to "${subject}".${summary ? `\n📝 ${summary}` : ''}\n⚠️ Heads up: this looks similar to another link already saved there — might be the same topic.`);
-    }
+    if (isSimilar) similarWarning = `\n⚠️ Heads up: this looks similar to another link already saved there.`;
   }
 
   const { error } = await supabase.from('links').insert({ subject, url, summary });
-  if (error) {
-    console.error('Addlink error:', error);
-    return sendMessage(senderId, "Error saving link.");
-  }
+  if (error) { console.error('Addlink error:', error); return sendMessage(senderId, "Error saving link."); }
   lastSubjectBySender[senderId] = subject;
-  return sendMessage(senderId, `✅ Added to "${subject}".${summary ? `\n📝 ${summary}` : ''}`);
+  return sendMessage(senderId, `✅ Added to "${subject}".${summary ? `\n📝 ${summary}` : ''}${similarWarning}`);
 }
 
 async function removeByNumber(senderId, subjectRaw, number) {
   const subject = subjectRaw.toLowerCase();
-  const { data, error } = await supabase
-    .from('links')
-    .select('id, url')
-    .eq('subject', subject)
-    .order('created_at', { ascending: true });
-
-  if (error) {
-    console.error('Removelink fetch error:', error);
-    return sendMessage(senderId, "Error fetching links.");
-  }
+  const { data, error } = await supabase.from('links').select('id, url').eq('subject', subject).order('created_at', { ascending: true });
+  if (error) { console.error('Removelink fetch error:', error); return sendMessage(senderId, "Error fetching links."); }
   if (!data || data.length === 0) return sendMessage(senderId, `No links found for "${subject}".`);
   if (number > data.length || number < 1) return sendMessage(senderId, `"${subject}" only has ${data.length} link(s).`);
 
   const target = data[number - 1];
   const { error: deleteError } = await supabase.from('links').delete().eq('id', target.id);
-  if (deleteError) {
-    console.error('Removelink delete error:', deleteError);
-    return sendMessage(senderId, "Error removing link.");
-  }
+  if (deleteError) { console.error('Removelink delete error:', deleteError); return sendMessage(senderId, "Error removing link."); }
   return sendMessage(senderId, `🗑️ Removed #${number} from "${subject}": ${target.url}`);
 }
 
 async function listSubjects(senderId) {
   const { data, error } = await supabase.from('links').select('subject');
-  if (error) {
-    console.error('Subjects error:', error);
-    return sendMessage(senderId, "Error fetching subjects.");
-  }
+  if (error) { console.error('Subjects error:', error); return sendMessage(senderId, "Error fetching subjects."); }
   const subjects = [...new Set(data.map(d => d.subject.toLowerCase()))];
   if (subjects.length === 0) return sendMessage(senderId, "No subjects tracked yet.");
   return sendMessage(senderId, `📂 Subjects: ${subjects.join(', ')}`);
 }
 
 async function listAllReviewers(senderId) {
-  const { data, error } = await supabase
-    .from('links')
-    .select('subject, url, summary, created_at')
-    .order('subject', { ascending: true })
-    .order('created_at', { ascending: true });
-
-  if (error) {
-    console.error('Reviewers error:', error);
-    return sendMessage(senderId, "Error fetching reviewers.");
-  }
+  const { data, error } = await supabase.from('links').select('subject, url, summary, created_at').order('subject', { ascending: true }).order('created_at', { ascending: true });
+  if (error) { console.error('Reviewers error:', error); return sendMessage(senderId, "Error fetching reviewers."); }
   if (!data || data.length === 0) return sendMessage(senderId, "No reviewers saved yet.");
 
   const grouped = {};
@@ -282,60 +350,29 @@ async function listAllReviewers(senderId) {
 }
 
 async function listRecent(senderId) {
-  const { data, error } = await supabase
-    .from('links')
-    .select('subject, url, summary, created_at')
-    .order('created_at', { ascending: false })
-    .limit(10);
-
-  if (error) {
-    console.error('Recent error:', error);
-    return sendMessage(senderId, "Error fetching recent links.");
-  }
+  const { data, error } = await supabase.from('links').select('subject, url, summary, created_at').order('created_at', { ascending: false }).limit(10);
+  if (error) { console.error('Recent error:', error); return sendMessage(senderId, "Error fetching recent links."); }
   if (!data || data.length === 0) return sendMessage(senderId, "No links saved yet.");
-
-  const list = data.map((l, i) =>
-    `${i + 1}. [${l.subject.toUpperCase()}] ${l.url} (${formatDate(l.created_at)})${l.summary ? `\n   — ${l.summary}` : ''}`
-  ).join('\n');
+  const list = data.map((l, i) => `${i + 1}. [${l.subject.toUpperCase()}] ${l.url} (${formatDate(l.created_at)})${l.summary ? `\n   — ${l.summary}` : ''}`).join('\n');
   return sendMessage(senderId, `🕒 Recently added:\n${list}`);
 }
 
 async function findLinks(senderId, keyword) {
-  const { data, error } = await supabase
-    .from('links')
-    .select('subject, url, summary, created_at')
-    .or(`subject.ilike.%${keyword}%,url.ilike.%${keyword}%,summary.ilike.%${keyword}%`)
-    .order('created_at', { ascending: false });
-
-  if (error) {
-    console.error('Find error:', error);
-    return sendMessage(senderId, "Error searching links.");
-  }
+  const { data, error } = await supabase.from('links').select('subject, url, summary, created_at').or(`subject.ilike.%${keyword}%,url.ilike.%${keyword}%,summary.ilike.%${keyword}%`).order('created_at', { ascending: false });
+  if (error) { console.error('Find error:', error); return sendMessage(senderId, "Error searching links."); }
   if (!data || data.length === 0) return sendMessage(senderId, `No results for "${keyword}".`);
-
-  const list = data.map((l, i) =>
-    `${i + 1}. [${l.subject.toUpperCase()}] ${l.url} (${formatDate(l.created_at)})`
-  ).join('\n');
+  const list = data.map((l, i) => `${i + 1}. [${l.subject.toUpperCase()}] ${l.url} (${formatDate(l.created_at)})`).join('\n');
   return sendMessage(senderId, `🔍 Results for "${keyword}":\n${list}`);
 }
 
 async function describeByNumber(senderId, subjectRaw, number) {
   const subject = subjectRaw.toLowerCase();
-  const { data, error } = await supabase
-    .from('links')
-    .select('id, url, summary')
-    .eq('subject', subject)
-    .order('created_at', { ascending: true });
-
-  if (error) {
-    console.error('Describe fetch error:', error);
-    return sendMessage(senderId, "Error fetching link.");
-  }
+  const { data, error } = await supabase.from('links').select('id, url, summary').eq('subject', subject).order('created_at', { ascending: true });
+  if (error) { console.error('Describe fetch error:', error); return sendMessage(senderId, "Error fetching link."); }
   if (!data || number > data.length || number < 1) return sendMessage(senderId, `Couldn't find #${number} in "${subject}".`);
 
   const target = data[number - 1];
   if (target.summary) return sendMessage(senderId, `📝 ${target.summary}`);
-
   if (!GROQ_API_KEY) return sendMessage(senderId, "No summary available.");
   const summary = await summarizeUrl(target.url);
   await supabase.from('links').update({ summary }).eq('id', target.id);
@@ -347,46 +384,41 @@ function sendHelp(senderId) {
 `🤖 Reviewer Bot Commands
 
 Add a link:
-• reviewer <subject> <link>
-• /addlink <subject> <link>
-• #<subject> <link>
-• paste a bare link — AI guesses the subject
+- reviewer <subject> <link>
+- #<subject> <link>
+- paste a bare link — AI guesses the subject
 
-View links for one subject:
-• reviewer <subject>
+View links:
+- reviewer <subject>
+- reviewers (all)
+- recent (last 10)
 
-View ALL reviewers:
-• reviewers
-
-List all subjects:
-• links / subjects
-
-Recently added:
-• recent
+Subjects:
+- links / subjects
 
 Search:
-• find <keyword>
-
-Describe a specific link:
-• describe <subject> <number>
+- find <keyword>
+- describe <subject> <number>
 
 Practice questions:
-• quiz <subject>
+- quiz <subject>
 
-Remove a link:
-• remove <number>
-• remove <subject> <number>
+Remove:
+- remove <number>
+- remove <subject> <number>
 
 Help:
-• help
+- help
 
-You can also just type naturally, e.g. "show me the biochem links" or "delete link 2 from nstp".`;
+Or just chat with me normally — I'll respond like a regular assistant!`;
   return sendMessage(senderId, helpText);
 }
 
 // ---------- MESSAGE HANDLER ----------
 
 async function handleMessage(text, senderId) {
+  await setRecipientPSID(senderId);
+
   const trimmed = text.trim();
   const lower = trimmed.toLowerCase();
   const words = trimmed.split(/\s+/);
@@ -464,11 +496,8 @@ async function handleMessage(text, senderId) {
 
   const tagMatch = trimmed.match(/#(\w+)/);
   const urlMatch = trimmed.match(/https?:\/\/\S+/);
-  if (tagMatch && urlMatch) {
-    return addLink(senderId, tagMatch[1].toLowerCase(), urlMatch[0]);
-  }
+  if (tagMatch && urlMatch) return addLink(senderId, tagMatch[1].toLowerCase(), urlMatch[0]);
 
-  // Bare link -> AI guesses subject
   const bareUrlMatch = trimmed.match(/^https?:\/\/\S+$/);
   if (bareUrlMatch && GROQ_API_KEY) {
     const url = bareUrlMatch[0];
@@ -477,7 +506,7 @@ async function handleMessage(text, senderId) {
     return addLink(senderId, subject, url, { summary, autoSummarize: false });
   }
 
-  // Natural language fallback
+  // Natural language: try to detect a command, otherwise just chat
   if (GROQ_API_KEY) {
     const parsed = await interpretNaturalLanguage(trimmed);
     switch (parsed.action) {
@@ -495,19 +524,21 @@ async function handleMessage(text, senderId) {
         break;
       case 'remove': {
         const subj = parsed.subject?.toLowerCase() || lastSubjectBySender[senderId];
-        if (!subj) return sendMessage(senderId, "Which subject did you mean?");
-        if (parsed.number) return removeByNumber(senderId, subj, parsed.number);
+        if (subj && parsed.number) return removeByNumber(senderId, subj, parsed.number);
         break;
       }
       case 'add':
         if (parsed.subject && parsed.url) return addLink(senderId, parsed.subject.toLowerCase(), parsed.url);
         break;
-      default:
-        break;
+      case 'chat':
+      default: {
+        const reply = await chatReply(trimmed);
+        return sendMessage(senderId, reply);
+      }
     }
   }
 
-  return sendMessage(senderId, `❓ Sorry, I didn't understand that. Type "help" to see available commands.`);
+  return sendMessage(senderId, `❓ Type "help" to see what I can do.`);
 }
 
 async function sendMessage(recipientId, text) {
