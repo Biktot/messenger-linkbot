@@ -6,7 +6,6 @@ app.use(express.json());
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 const lastSubjectBySender = {};
@@ -35,76 +34,12 @@ app.post('/webhook', async (req, res) => {
   res.status(200).send('EVENT_RECEIVED');
 });
 
-// ---------- AI HELPERS ----------
-
-async function askGemini(systemPrompt, userMessage) {
-  try {
-    const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        contents: [{ parts: [{ text: userMessage }] }],
-        systemInstruction: { parts: [{ text: systemPrompt }] },
-      },
-      { headers: { 'Content-Type': 'application/json' } }
-    );
-    return response.data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
-  } catch (err) {
-    console.error('Gemini error:', err.response?.data || err.message);
-    return null;
-  }
-}
-
-async function fetchPageTitle(url) {
-  try {
-    const res = await axios.get(url, { timeout: 5000, headers: { 'User-Agent': 'Mozilla/5.0' } });
-    const match = res.data.match(/<title>(.*?)<\/title>/is);
-    return match ? match[1].trim() : '';
-  } catch {
-    return '';
-  }
-}
-
-async function guessSubjectAndSummary(url) {
-  const title = await fetchPageTitle(url);
-  const raw = await askGemini(
-    'You help sort study reviewer links for a nursing student (subjects like anaphy, biochem, nstp, theoretical foundation of nursing, philippine history). Given a link and its page title, respond with ONLY two lines, no extra text:\nSUBJECT: <one short lowercase word/tag guessing the subject>\nSUMMARY: <one short sentence describing what the link likely covers>',
-    `URL: ${url}\nPage title: ${title || '(unknown)'}`
-  );
-  if (!raw) return { subject: 'misc', summary: '' };
-
-  const subjectMatch = raw.match(/SUBJECT:\s*(.+)/i);
-  const summaryMatch = raw.match(/SUMMARY:\s*(.+)/i);
-  return {
-    subject: subjectMatch ? subjectMatch[1].trim().toLowerCase().split(/\s+/)[0] : 'misc',
-    summary: summaryMatch ? summaryMatch[1].trim() : '',
-  };
-}
-
-async function interpretNaturalLanguage(text) {
-  const raw = await askGemini(
-    `You control a study-reviewer bot. Map the user's message to ONE action. Respond with ONLY JSON, no extra text, in one of these shapes:
-{"action":"list_links","subject":"<subject>"}
-{"action":"list_subjects"}
-{"action":"remove","subject":"<subject or null>","number":<number>}
-{"action":"add","subject":"<subject>","url":"<url>"}
-{"action":"unknown"}
-Use "unknown" if the message isn't related to managing reviewer links.`,
-    text
-  );
-  try {
-    const cleaned = raw.replace(/```json|```/g, '').trim();
-    return JSON.parse(cleaned);
-  } catch {
-    return { action: 'unknown' };
-  }
-}
-
 // ---------- CORE ACTIONS ----------
 
 async function listSubjectLinks(senderId, subject) {
   const { data, error } = await supabase
     .from('links')
-    .select('id, url, summary')
+    .select('id, url')
     .eq('subject', subject)
     .order('created_at', { ascending: true });
 
@@ -115,18 +50,18 @@ async function listSubjectLinks(senderId, subject) {
   if (!data || data.length === 0) return sendMessage(senderId, `No links found for "${subject}" yet.`);
 
   lastSubjectBySender[senderId] = subject;
-  const list = data.map((l, i) => `${i + 1}. ${l.url}${l.summary ? `\n   — ${l.summary}` : ''}`).join('\n');
+  const list = data.map((l, i) => `${i + 1}. ${l.url}`).join('\n');
   return sendMessage(senderId, `📚 ${subject.toUpperCase()} reviewers:\n${list}`);
 }
 
-async function addLink(senderId, subject, url, summary = null) {
-  const { error } = await supabase.from('links').insert({ subject, url, summary });
+async function addLink(senderId, subject, url) {
+  const { error } = await supabase.from('links').insert({ subject, url });
   if (error) {
     console.error('Addlink error:', error);
     return sendMessage(senderId, "Error saving link.");
   }
   lastSubjectBySender[senderId] = subject;
-  return sendMessage(senderId, `✅ Added to "${subject}".${summary ? `\n📝 ${summary}` : ''}`);
+  return sendMessage(senderId, `✅ Added to "${subject}".`);
 }
 
 async function removeByNumber(senderId, subject, number) {
@@ -163,12 +98,45 @@ async function listSubjects(senderId) {
   return sendMessage(senderId, `📂 Subjects: ${subjects.join(', ')}`);
 }
 
+function sendHelp(senderId) {
+  const helpText =
+`🤖 Reviewer Bot Commands
+
+Add a link:
+• reviewer <subject> <link>
+• /addlink <subject> <link>
+• #<subject> <link>
+
+View links:
+• reviewer <subject>
+• /reviewer <subject>
+
+List all subjects:
+• links
+• subjects
+• /subjects
+
+Remove a link:
+• remove <number>  (uses last subject you viewed/added)
+• remove <subject> <number>
+• /removelink <subject> <number>
+
+Help:
+• help`;
+  return sendMessage(senderId, helpText);
+}
+
 // ---------- MESSAGE HANDLER ----------
 
 async function handleMessage(text, senderId) {
   const trimmed = text.trim();
   const lower = trimmed.toLowerCase();
   const words = trimmed.split(/\s+/);
+
+  // ---- HELP ----
+  if (lower === 'help' || lower === '/help') {
+    return sendHelp(senderId);
+  }
 
   // ---- SLASH COMMANDS ----
   if (lower.startsWith('/reviewer')) {
@@ -233,36 +201,9 @@ async function handleMessage(text, senderId) {
     return addLink(senderId, subject, url);
   }
 
-  // ---- BARE LINK -> AI GUESSES SUBJECT + SUMMARY ----
-  const bareUrlMatch = trimmed.match(/^https?:\/\/\S+$/);
-  if (bareUrlMatch && GEMINI_API_KEY) {
-    const url = bareUrlMatch[0];
-    await sendMessage(senderId, "🤖 Let me figure out where this goes...");
-    const { subject, summary } = await guessSubjectAndSummary(url);
-    return addLink(senderId, subject, url, summary);
-  }
-
-  // ---- NATURAL LANGUAGE FALLBACK ----
-  if (GEMINI_API_KEY) {
-    const parsed = await interpretNaturalLanguage(trimmed);
-    switch (parsed.action) {
-      case 'list_links':
-        if (parsed.subject) return listSubjectLinks(senderId, parsed.subject.toLowerCase());
-        break;
-      case 'list_subjects':
-        return listSubjects(senderId);
-      case 'remove': {
-        const subj = parsed.subject?.toLowerCase() || lastSubjectBySender[senderId];
-        if (!subj) return sendMessage(senderId, "Which subject did you mean?");
-        if (parsed.number) return removeByNumber(senderId, subj, parsed.number);
-        break;
-      }
-      case 'add':
-        if (parsed.subject && parsed.url) return addLink(senderId, parsed.subject.toLowerCase(), parsed.url);
-        break;
-      default:
-        break;
-    }
+  // ---- FALLBACK: unrecognized message, gently point to help ----
+  if (lower.startsWith('reviewer') || lower.startsWith('remove') || urlMatch) {
+    return sendMessage(senderId, `Not sure what you meant. Type "help" to see all commands.`);
   }
 }
 
