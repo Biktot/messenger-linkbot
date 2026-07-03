@@ -10,6 +10,7 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 const lastSubjectBySender = {};
+const lastProjectBySender = {};
 
 // ---------- GROQ HELPERS ----------
 
@@ -64,16 +65,16 @@ async function guessSubjectAndSummary(url) {
 async function summarizeUrl(url) {
   const title = await fetchPageTitle(url);
   const raw = await askGroq(
-    'Write ONE short sentence (max 15 words) describing what this study link likely covers. No preamble, just the sentence.',
+    'Write ONE short sentence (max 15 words) describing what this link likely covers. No preamble, just the sentence.',
     `URL: ${url}\nPage title: ${title || '(unknown)'}`
   );
   return raw || '';
 }
 
-async function checkSimilar(subject, newUrl, existingUrls) {
+async function checkSimilar(existingUrls, newUrl) {
   if (existingUrls.length === 0) return null;
   const raw = await askGroq(
-    'You check if a new study link duplicates the topic of existing links in the same subject. Respond with ONLY "YES" or "NO" — YES only if the new link very likely covers the same specific topic as one of the existing ones.',
+    'You check if a new link duplicates the topic of existing links. Respond with ONLY "YES" or "NO".',
     `Existing links:\n${existingUrls.join('\n')}\n\nNew link: ${newUrl}`
   );
   return raw?.trim().toUpperCase() === 'YES';
@@ -81,7 +82,7 @@ async function checkSimilar(subject, newUrl, existingUrls) {
 
 async function interpretNaturalLanguage(text) {
   const raw = await askGroq(
-    `You control a study-reviewer bot. Map the message to ONE action as JSON only, no extra text:
+    `You control a bot with these real features: (1) reviewer links organized by subject, (2) project links organized by project name, (3) a daily class schedule notifier that messages the user each morning and when a class period starts. Map the message to ONE action as JSON only, no extra text:
 {"action":"list_links","subject":"<subject>"}
 {"action":"list_subjects"}
 {"action":"list_all"}
@@ -89,8 +90,11 @@ async function interpretNaturalLanguage(text) {
 {"action":"remove","subject":"<subject or null>","number":<number>}
 {"action":"add","subject":"<subject>","url":"<url>"}
 {"action":"find","keyword":"<keyword>"}
+{"action":"list_project","project":"<project name>"}
+{"action":"list_projects"}
+{"action":"add_project","project":"<project name>","url":"<url>"}
 {"action":"chat"}
-Use "chat" if the message is casual conversation, a question, or anything not about managing reviewer links.`,
+Use "chat" for casual conversation, questions about the bot's features, or anything else.`,
     text
   );
   try {
@@ -102,15 +106,24 @@ Use "chat" if the message is casual conversation, a question, or anything not ab
 
 async function generateQuiz(subject) {
   const raw = await askGroq(
-    'You are a nursing school reviewer. Generate 3 short practice questions (no answers) about the given topic, numbered 1-3. Keep each question one line.',
+    'You are a nursing school reviewer. Generate 3 short practice questions (no answers) about the given topic, numbered 1-3.',
     `Topic: ${subject}`
   );
   return raw || 'Could not generate quiz questions right now.';
 }
 
+const BOT_FEATURES_DESCRIPTION = `
+Real features you actually have (only mention these, don't make anything else up):
+1. Reviewer link organizer — save study reviewer links by subject (e.g. "reviewer anaphy <link>"), list them, search, remove.
+2. Project link organizer — save project-related links separately by project name (e.g. "project thesis <link>" or "pr thesis <link>"), list them per project.
+3. Daily class schedule notifier — every morning around 6 AM it messages with the first class of the day, and pings again whenever a new class period starts, based on a saved weekly schedule.
+4. Quiz generator — "quiz <subject>" generates a few practice questions on a topic.
+5. You can also just chat normally for casual conversation or questions.
+`;
+
 async function chatReply(text) {
   const raw = await askGroq(
-    `You are a friendly, helpful assistant chatting with a Philippine BSN nursing student inside Messenger. Keep replies short (2-4 sentences max), warm, and conversational — like texting a helpful friend. You can casually mention you also manage their study reviewer links if it fits naturally, but don't force it every time.`,
+    `You are a friendly, helpful assistant chatting with a Philippine BSN nursing student inside Messenger. Keep replies short (2-4 sentences), warm, conversational. ${BOT_FEATURES_DESCRIPTION} If asked what you can do, summarize ONLY these real features, don't invent others.`,
     text
   );
   return raw || "Sorry, I'm having trouble responding right now.";
@@ -134,13 +147,13 @@ function getTimeString(phDate) {
   return `${h}:${m}`;
 }
 
-async function getRecipientPSID() {
-  const { data } = await supabase.from('bot_state').select('value').eq('key', 'recipient_psid').maybeSingle();
-  return data?.value || null;
+async function addRecipient(psid) {
+  await supabase.from('recipients').upsert({ psid });
 }
 
-async function setRecipientPSID(psid) {
-  await supabase.from('bot_state').upsert({ key: 'recipient_psid', value: psid });
+async function getAllRecipients() {
+  const { data } = await supabase.from('recipients').select('psid');
+  return data ? data.map(r => r.psid) : [];
 }
 
 async function getLastNotifiedPeriod() {
@@ -184,29 +197,23 @@ app.get('/cron/morning-brief', async (req, res) => {
   try {
     const phTime = getPHTime();
     const day = getDayCode(phTime);
-    const psid = await getRecipientPSID();
-    if (!psid) return res.status(200).send('No recipient set yet.');
+    const recipients = await getAllRecipients();
+    if (recipients.length === 0) return res.status(200).send('No recipients yet.');
 
+    let messageText;
     if (day === 'MON' || day === 'SUN') {
-      await sendMessage(psid, `☀️ Good morning! No classes today. Rest well!`);
-      return res.status(200).send('Sent: no class day.');
+      messageText = `☀️ Good morning! No classes today. Rest well!`;
+    } else {
+      const { data } = await supabase.from('schedule').select('subject, start_time').eq('day', day).order('start_time', { ascending: true }).limit(1);
+      messageText = (data && data.length > 0)
+        ? `☀️ Good morning! Your first class today is ${data[0].subject} at ${data[0].start_time}.`
+        : `☀️ Good morning! No classes scheduled today.`;
     }
 
-    const { data, error } = await supabase
-      .from('schedule')
-      .select('subject, start_time, end_time')
-      .eq('day', day)
-      .order('start_time', { ascending: true })
-      .limit(1);
-
-    if (error || !data || data.length === 0) {
-      await sendMessage(psid, `☀️ Good morning! No classes scheduled today.`);
-      return res.status(200).send('Sent: no classes.');
+    for (const psid of recipients) {
+      await sendMessage(psid, messageText);
     }
-
-    const first = data[0];
-    await sendMessage(psid, `☀️ Good morning! Your first class today is ${first.subject} at ${first.start_time}.`);
-    res.status(200).send('Sent.');
+    res.status(200).send(`Sent to ${recipients.length} recipient(s).`);
   } catch (err) {
     console.error('Morning brief error:', err);
     res.status(500).send('Error');
@@ -218,17 +225,12 @@ app.get('/cron/check-schedule', async (req, res) => {
     const phTime = getPHTime();
     const day = getDayCode(phTime);
     const currentTime = getTimeString(phTime);
-    const psid = await getRecipientPSID();
-    if (!psid) return res.status(200).send('No recipient set yet.');
+    const recipients = await getAllRecipients();
+    if (recipients.length === 0) return res.status(200).send('No recipients yet.');
     if (day === 'MON' || day === 'SUN') return res.status(200).send('No class day.');
 
-    const { data, error } = await supabase
-      .from('schedule')
-      .select('subject, start_time, end_time')
-      .eq('day', day)
-      .order('start_time', { ascending: true });
-
-    if (error || !data) return res.status(200).send('No schedule.');
+    const { data } = await supabase.from('schedule').select('subject, start_time, end_time').eq('day', day).order('start_time', { ascending: true });
+    if (!data) return res.status(200).send('No schedule.');
 
     const nowMinutes = parseInt(currentTime.split(':')[0]) * 60 + parseInt(currentTime.split(':')[1]);
 
@@ -241,7 +243,9 @@ app.get('/cron/check-schedule', async (req, res) => {
         const periodKey = `${day}-${period.start_time}`;
         const lastNotified = await getLastNotifiedPeriod();
         if (lastNotified !== periodKey) {
-          await sendMessage(psid, `📚 ${period.subject} is starting now (${period.start_time} - ${period.end_time}).`);
+          for (const psid of recipients) {
+            await sendMessage(psid, `📚 ${period.subject} is starting now (${period.start_time} - ${period.end_time}).`);
+          }
           await setLastNotifiedPeriod(periodKey);
         }
       }
@@ -260,16 +264,11 @@ function formatDate(isoString) {
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
-// ---------- CORE ACTIONS ----------
+// ---------- REVIEWER LINK ACTIONS ----------
 
 async function listSubjectLinks(senderId, subjectRaw) {
   const subject = subjectRaw.toLowerCase();
-  const { data, error } = await supabase
-    .from('links')
-    .select('id, url, summary, created_at')
-    .eq('subject', subject)
-    .order('created_at', { ascending: true });
-
+  const { data, error } = await supabase.from('links').select('id, url, summary, created_at').eq('subject', subject).order('created_at', { ascending: true });
   if (error) { console.error('List error:', error); return sendMessage(senderId, "Error fetching links."); }
   if (!data || data.length === 0) return sendMessage(senderId, `No links found for "${subject}" yet.`);
 
@@ -296,7 +295,7 @@ async function addLink(senderId, subjectRaw, url, opts = {}) {
 
   let similarWarning = '';
   if (GROQ_API_KEY && existingRows && existingRows.length > 0 && opts.skipSimilarCheck !== true) {
-    const isSimilar = await checkSimilar(subject, url, existingRows.map(r => r.url));
+    const isSimilar = await checkSimilar(existingRows.map(r => r.url), url);
     if (isSimilar) similarWarning = `\n⚠️ Heads up: this looks similar to another link already saved there.`;
   }
 
@@ -379,45 +378,118 @@ async function describeByNumber(senderId, subjectRaw, number) {
   return sendMessage(senderId, `📝 ${summary || 'Could not generate a summary for this link.'}`);
 }
 
+// ---------- PROJECT LINK ACTIONS ----------
+
+async function listProjectLinks(senderId, projectRaw) {
+  const project = projectRaw.toLowerCase();
+  const { data, error } = await supabase.from('projects').select('id, url, summary, created_at').eq('project_name', project).order('created_at', { ascending: true });
+  if (error) { console.error('Project list error:', error); return sendMessage(senderId, "Error fetching project links."); }
+  if (!data || data.length === 0) return sendMessage(senderId, `No links found for project "${project}" yet.`);
+
+  lastProjectBySender[senderId] = project;
+  const list = data.map((l, i) => `${i + 1}. ${l.url} (${formatDate(l.created_at)})${l.summary ? `\n   — ${l.summary}` : ''}`).join('\n');
+  return sendMessage(senderId, `🗂️ ${project.toUpperCase()} project links:\n${list}`);
+}
+
+async function addProjectLink(senderId, projectRaw, url) {
+  const project = projectRaw.toLowerCase();
+  const { data: existingRows, error: fetchError } = await supabase.from('projects').select('id, url').eq('project_name', project);
+  if (fetchError) { console.error('Project fetch error:', fetchError); return sendMessage(senderId, "Error checking existing project links."); }
+
+  const exactDupe = existingRows?.find(r => r.url === url);
+  if (exactDupe) {
+    lastProjectBySender[senderId] = project;
+    return sendMessage(senderId, `⚠️ That exact link is already saved under project "${project}".`);
+  }
+
+  let summary = null;
+  if (GROQ_API_KEY) summary = await summarizeUrl(url);
+
+  const { error } = await supabase.from('projects').insert({ project_name: project, url, summary });
+  if (error) { console.error('Add project link error:', error); return sendMessage(senderId, "Error saving project link."); }
+  lastProjectBySender[senderId] = project;
+  return sendMessage(senderId, `✅ Added to project "${project}".${summary ? `\n📝 ${summary}` : ''}`);
+}
+
+async function removeProjectByNumber(senderId, projectRaw, number) {
+  const project = projectRaw.toLowerCase();
+  const { data, error } = await supabase.from('projects').select('id, url').eq('project_name', project).order('created_at', { ascending: true });
+  if (error) { console.error('Remove project fetch error:', error); return sendMessage(senderId, "Error fetching project links."); }
+  if (!data || data.length === 0) return sendMessage(senderId, `No links found for project "${project}".`);
+  if (number > data.length || number < 1) return sendMessage(senderId, `Project "${project}" only has ${data.length} link(s).`);
+
+  const target = data[number - 1];
+  const { error: deleteError } = await supabase.from('projects').delete().eq('id', target.id);
+  if (deleteError) { console.error('Remove project delete error:', deleteError); return sendMessage(senderId, "Error removing project link."); }
+  return sendMessage(senderId, `🗑️ Removed #${number} from project "${project}": ${target.url}`);
+}
+
+async function listProjectNames(senderId) {
+  const { data, error } = await supabase.from('projects').select('project_name');
+  if (error) { console.error('Project names error:', error); return sendMessage(senderId, "Error fetching projects."); }
+  const names = [...new Set(data.map(d => d.project_name.toLowerCase()))];
+  if (names.length === 0) return sendMessage(senderId, "No projects tracked yet.");
+  return sendMessage(senderId, `🗂️ Projects: ${names.join(', ')}`);
+}
+
+async function listAllProjects(senderId) {
+  const { data, error } = await supabase.from('projects').select('project_name, url, summary, created_at').order('project_name', { ascending: true }).order('created_at', { ascending: true });
+  if (error) { console.error('All projects error:', error); return sendMessage(senderId, "Error fetching projects."); }
+  if (!data || data.length === 0) return sendMessage(senderId, "No project links saved yet.");
+
+  const grouped = {};
+  for (const row of data) {
+    const proj = row.project_name.toLowerCase();
+    if (!grouped[proj]) grouped[proj] = [];
+    grouped[proj].push(row);
+  }
+
+  let output = "🗂️ All Projects:\n";
+  for (const project of Object.keys(grouped)) {
+    output += `\n${project.toUpperCase()}:\n`;
+    grouped[project].forEach((row, i) => {
+      output += `  ${i + 1}. ${row.url} (${formatDate(row.created_at)})${row.summary ? `\n     — ${row.summary}` : ''}\n`;
+    });
+  }
+  return sendMessage(senderId, output.trim());
+}
+
+// ---------- HELP ----------
+
 function sendHelp(senderId) {
   const helpText =
-`🤖 Reviewer Bot Commands
+`🤖 Bot Commands
 
-Add a link:
+📚 REVIEWERS (by subject):
 - reviewer <subject> <link>
 - #<subject> <link>
 - paste a bare link — AI guesses the subject
-
-View links:
-- reviewer <subject>
-- reviewers (all)
-- recent (last 10)
-
-Subjects:
-- links / subjects
-
-Search:
+- reviewer <subject> — view
+- reviewers — view all
+- recent — last 10 added
+- links / subjects — list subjects
 - find <keyword>
 - describe <subject> <number>
+- remove <number> / remove <subject> <number>
 
-Practice questions:
-- quiz <subject>
+🗂️ PROJECTS (by project name):
+- project <name> <link>  (or: pr <name> <link> / proj <name> <link>)
+- project <name> — view links for that project
+- projects — list all project names
+- allprojects — view everything
 
-Remove:
-- remove <number>
-- remove <subject> <number>
-
-Help:
-- help
-
-Or just chat with me normally — I'll respond like a regular assistant!`;
+📝 OTHER:
+- quiz <subject> — practice questions
+- help — this menu
+- Daily class schedule alerts (automatic, no command needed)
+- Or just chat with me normally!`;
   return sendMessage(senderId, helpText);
 }
 
 // ---------- MESSAGE HANDLER ----------
 
 async function handleMessage(text, senderId) {
-  await setRecipientPSID(senderId);
+  await addRecipient(senderId);
 
   const trimmed = text.trim();
   const lower = trimmed.toLowerCase();
@@ -426,6 +498,8 @@ async function handleMessage(text, senderId) {
   if (lower === 'help' || lower === '/help') return sendHelp(senderId);
   if (lower === 'reviewers' || lower === '/reviewers') return listAllReviewers(senderId);
   if (lower === 'recent' || lower === '/recent') return listRecent(senderId);
+  if (lower === 'projects') return listProjectNames(senderId);
+  if (lower === 'allprojects') return listAllProjects(senderId);
 
   if (lower.startsWith('find ')) {
     const keyword = trimmed.slice(5).trim();
@@ -447,6 +521,15 @@ async function handleMessage(text, senderId) {
     await sendMessage(senderId, "🤔 Generating a few practice questions...");
     const quiz = await generateQuiz(subject);
     return sendMessage(senderId, `📝 Quick practice — ${subject.toUpperCase()}:\n${quiz}`);
+  }
+
+  // ---- PROJECT COMMANDS: project / pr / proj ----
+  if (lower.startsWith('project ') || lower.startsWith('pr ') || lower.startsWith('proj ')) {
+    const projectName = words[1]?.toLowerCase();
+    const url = words[2];
+    if (!projectName) return sendMessage(senderId, "Usage: project <name> [link]");
+    if (url && /^https?:\/\//.test(url)) return addProjectLink(senderId, projectName, url);
+    return listProjectLinks(senderId, projectName);
   }
 
   if (lower.startsWith('/reviewer')) {
@@ -471,6 +554,21 @@ async function handleMessage(text, senderId) {
 
   if (lower.startsWith('/subjects')) return listSubjects(senderId);
   if (lower === 'links' || lower === 'subjects') return listSubjects(senderId);
+
+  // ---- REMOVE: handles both reviewer and project removal ----
+  if (lower.startsWith('removeproject ')) {
+    const restWords = words.slice(1);
+    if (restWords.length >= 2 && !isNaN(parseInt(restWords[1], 10))) {
+      const project = restWords[0].toLowerCase();
+      const number = parseInt(restWords[1], 10);
+      return removeProjectByNumber(senderId, project, number);
+    }
+    const number = parseInt(restWords[0], 10);
+    const project = lastProjectBySender[senderId];
+    if (!project) return sendMessage(senderId, "I don't know which project — try 'project <name>' first, or use 'removeproject <name> <number>'.");
+    if (!number) return sendMessage(senderId, "Usage: removeproject <number> OR removeproject <name> <number>");
+    return removeProjectByNumber(senderId, project, number);
+  }
 
   if (lower.startsWith('remove ')) {
     const restWords = words.slice(1);
@@ -506,7 +604,7 @@ async function handleMessage(text, senderId) {
     return addLink(senderId, subject, url, { summary, autoSummarize: false });
   }
 
-  // Natural language: try to detect a command, otherwise just chat
+  // Natural language fallback (chat-aware of real features)
   if (GROQ_API_KEY) {
     const parsed = await interpretNaturalLanguage(trimmed);
     switch (parsed.action) {
@@ -529,6 +627,14 @@ async function handleMessage(text, senderId) {
       }
       case 'add':
         if (parsed.subject && parsed.url) return addLink(senderId, parsed.subject.toLowerCase(), parsed.url);
+        break;
+      case 'list_project':
+        if (parsed.project) return listProjectLinks(senderId, parsed.project.toLowerCase());
+        break;
+      case 'list_projects':
+        return listProjectNames(senderId);
+      case 'add_project':
+        if (parsed.project && parsed.url) return addProjectLink(senderId, parsed.project.toLowerCase(), parsed.url);
         break;
       case 'chat':
       default: {
