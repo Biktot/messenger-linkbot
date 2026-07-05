@@ -10,11 +10,9 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-const lastSubjectBySender = {};
-const lastProjectBySender = {};
-const lastImageBySender = {};
-const conversationHistory = {};
+const conversationHistory = {}; // short-term in-process cache; source of truth is Supabase bot_state
 const MAX_HISTORY_MESSAGES = 10;
+const DAILY_AI_LIMIT = 60; // per-sender AI-powered calls per day (Groq/Tavily), generous for 2 users
 
 const LAT = 15.5333;
 const LON = 119.9333;
@@ -25,9 +23,60 @@ function addToHistory(senderId, role, content) {
   if (conversationHistory[senderId].length > MAX_HISTORY_MESSAGES) {
     conversationHistory[senderId] = conversationHistory[senderId].slice(-MAX_HISTORY_MESSAGES);
   }
+  // fire-and-forget persistence so a Render restart doesn't wipe context
+  supabase.from('bot_state').upsert({ key: `history:${senderId}`, value: JSON.stringify(conversationHistory[senderId]) }).then(() => {}, () => {});
 }
-function getHistory(senderId) {
-  return conversationHistory[senderId] || [];
+
+async function getHistory(senderId) {
+  if (conversationHistory[senderId]) return conversationHistory[senderId];
+  const { data } = await supabase.from('bot_state').select('value').eq('key', `history:${senderId}`).maybeSingle();
+  try {
+    const parsed = data?.value ? JSON.parse(data.value) : [];
+    conversationHistory[senderId] = parsed;
+    return parsed;
+  } catch {
+    return [];
+  }
+}
+
+// ---------- PERSISTENT PER-SENDER STATE (survives restarts/deploys) ----------
+
+async function getLastSubject(senderId) {
+  const { data } = await supabase.from('bot_state').select('value').eq('key', `lastSubject:${senderId}`).maybeSingle();
+  return data?.value || null;
+}
+async function setLastSubject(senderId, subject) {
+  await supabase.from('bot_state').upsert({ key: `lastSubject:${senderId}`, value: subject });
+}
+async function getLastProject(senderId) {
+  const { data } = await supabase.from('bot_state').select('value').eq('key', `lastProject:${senderId}`).maybeSingle();
+  return data?.value || null;
+}
+async function setLastProject(senderId, project) {
+  await supabase.from('bot_state').upsert({ key: `lastProject:${senderId}`, value: project });
+}
+async function getLastImage(senderId) {
+  const { data } = await supabase.from('bot_state').select('value').eq('key', `lastImage:${senderId}`).maybeSingle();
+  try {
+    return data?.value ? JSON.parse(data.value) : null;
+  } catch {
+    return null;
+  }
+}
+async function setLastImage(senderId, imageObj) {
+  await supabase.from('bot_state').upsert({ key: `lastImage:${senderId}`, value: JSON.stringify(imageObj) });
+}
+
+// ---------- RATE LIMITING (protects Groq/Tavily usage) ----------
+
+async function checkAndIncrementUsage(senderId) {
+  const todayStr = getPHTime().toISOString().split('T')[0];
+  const key = `usage:${senderId}:${todayStr}`;
+  const { data } = await supabase.from('bot_state').select('value').eq('key', key).maybeSingle();
+  const count = data?.value ? parseInt(data.value, 10) : 0;
+  if (count >= DAILY_AI_LIMIT) return false;
+  await supabase.from('bot_state').upsert({ key, value: String(count + 1) });
+  return true;
 }
 
 // ---------- PROFILE NAME ----------
@@ -154,13 +203,18 @@ async function answerQuestions(questionsText) {
 async function parseReminder(text) {
   const today = getPHTime().toISOString().split('T')[0];
   const raw = await askGroq(
-    `Extract a reminder description and due date from the message. Today's date is ${today} (Philippines). Respond with ONLY JSON: {"description":"<short description>","due_date":"YYYY-MM-DD"}. If no clear date, use null for due_date.`,
+    `Extract a reminder description, due date, and recurrence from the message. Today's date is ${today} (Philippines). Respond with ONLY JSON: {"description":"<short description>","due_date":"YYYY-MM-DD","recurring":"none, weekly, or monthly"}. If no clear date, use null for due_date. Only set recurring if the user clearly implies repetition (e.g. "every week", "weekly", "every month") — otherwise "none".`,
     text
   );
   try {
-    return JSON.parse((raw || '').replace(/```json|```/g, '').trim());
+    const parsed = JSON.parse((raw || '').replace(/```json|```/g, '').trim());
+    return {
+      description: parsed.description ?? null,
+      due_date: parsed.due_date ?? null,
+      recurring: ['weekly', 'monthly'].includes(parsed.recurring) ? parsed.recurring : 'none',
+    };
   } catch {
-    return { description: null, due_date: null };
+    return { description: null, due_date: null, recurring: 'none' };
   }
 }
 
@@ -207,7 +261,7 @@ async function answerWithWebSearch(query, senderId) {
     .map((r, i) => `[${i + 1}] ${r.title}\n${r.snippet}\nSource: ${r.link}`)
     .join('\n\n');
 
-  const history = getHistory(senderId);
+  const history = await getHistory(senderId);
   const raw = await askGroq(
     `You are a helpful assistant answering using live web search results provided below. Summarize the answer clearly and concisely (3-6 sentences) in your own words for a Philippine BSN nursing student on Messenger. Mention the source name briefly if relevant (e.g. "according to X"). Do not quote text verbatim — paraphrase. If the results don't actually answer the question, say so honestly.\n\nWeb search results:\n${context}`,
     query,
@@ -219,7 +273,7 @@ async function answerWithWebSearch(query, senderId) {
 // ---------- NATURAL LANGUAGE ROUTING ----------
 
 async function interpretNaturalLanguage(text, senderId) {
-  const history = getHistory(senderId);
+  const history = await getHistory(senderId);
   const raw = await askGroq(
     `You control a bot with these real features: reviewer links by subject, project links by project name, a daily class schedule (checkable + automatic alerts), a quiz generator, flashcards, topic explanations, deadline reminders, weather check, a shared to-do list, image analysis (send a photo of notes/diagrams/questions), and live web search for current information not in your own knowledge. Map the message to ONE action as JSON only:
 {"action":"list_links","subject":"<subject>"}
@@ -256,7 +310,7 @@ Real features (only mention these, don't invent others):
 `;
 
 async function chatReply(text, senderId) {
-  const history = getHistory(senderId);
+  const history = await getHistory(senderId);
   const raw = await askGroq(
     `You are a friendly assistant chatting with a Philippine BSN nursing student on Messenger. Keep replies short (2-4 sentences), warm, conversational. Use history for context. ${BOT_FEATURES_DESCRIPTION}`,
     text, history
@@ -384,11 +438,19 @@ app.get('/cron/morning-brief', async (req, res) => {
       tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
       const tomorrowStr = tomorrow.toISOString().split('T')[0];
 
-      const { data: dueReminders } = await supabase.from('reminders').select('description, due_date').in('due_date', [todayStr, tomorrowStr]);
+      const { data: dueReminders } = await supabase.from('reminders').select('id, description, due_date, recurring').in('due_date', [todayStr, tomorrowStr]);
       if (dueReminders && dueReminders.length > 0) {
         for (const r of dueReminders) {
           const when = r.due_date === todayStr ? 'TODAY' : 'TOMORROW';
           for (const psid of recipients) await sendMessage(psid, `⏰ Reminder: "${r.description}" is due ${when} (${r.due_date}).`);
+
+          // Push recurring reminders forward once their due date arrives, instead of letting them go stale
+          if (r.due_date === todayStr && r.recurring && r.recurring !== 'none') {
+            const next = new Date(phTime);
+            next.setUTCDate(next.getUTCDate() + (r.recurring === 'weekly' ? 7 : 30));
+            const nextStr = next.toISOString().split('T')[0];
+            await supabase.from('reminders').update({ due_date: nextStr }).eq('id', r.id);
+          }
         }
       }
       await setLastReminderCheckDate(todayStr);
@@ -446,7 +508,7 @@ async function listSubjectLinks(senderId, subjectRaw) {
   const { data, error } = await supabase.from('links').select('id, url, summary, added_by, created_at').eq('subject', subject).order('created_at', { ascending: true });
   if (error) { console.error(error); return sendMessage(senderId, "Error fetching links."); }
   if (!data || data.length === 0) return sendMessage(senderId, `No links found for "${subject}" yet.`);
-  lastSubjectBySender[senderId] = subject;
+  await setLastSubject(senderId, subject);
   const list = data.map((l, i) => `${i + 1}. ${l.url} (${formatDate(l.created_at)}${l.added_by ? `, by ${l.added_by}` : ''})${l.summary ? `\n   — ${l.summary}` : ''}`).join('\n');
   return sendMessage(senderId, `📚 ${subject.toUpperCase()} reviewers:\n${list}`);
 }
@@ -457,7 +519,7 @@ async function addLink(senderId, subjectRaw, url, opts = {}) {
   if (fetchError) { console.error(fetchError); return sendMessage(senderId, "Error checking existing links."); }
 
   const exactDupe = existingRows?.find(r => r.url === url);
-  if (exactDupe) { lastSubjectBySender[senderId] = subject; return sendMessage(senderId, `⚠️ That exact link is already saved under "${subject}".`); }
+  if (exactDupe) { await setLastSubject(senderId, subject); return sendMessage(senderId, `⚠️ That exact link is already saved under "${subject}".`); }
 
   let summary = opts.summary ?? null;
   if (summary === null && GROQ_API_KEY && opts.autoSummarize !== false) summary = await summarizeUrl(url);
@@ -471,7 +533,7 @@ async function addLink(senderId, subjectRaw, url, opts = {}) {
   const addedBy = await getProfileName(senderId);
   const { error } = await supabase.from('links').insert({ subject, url, summary, added_by: addedBy });
   if (error) { console.error(error); return sendMessage(senderId, "Error saving link."); }
-  lastSubjectBySender[senderId] = subject;
+  await setLastSubject(senderId, subject);
   return sendMessage(senderId, `✅ Added to "${subject}" by ${addedBy}.${summary ? `\n📝 ${summary}` : ''}${similarWarning}`);
 }
 
@@ -526,7 +588,7 @@ async function listRecent(senderId) {
 async function findLinks(senderId, keyword) {
   const { data, error } = await supabase.from('links').select('subject, url, summary, created_at').or(`subject.ilike.%${keyword}%,url.ilike.%${keyword}%,summary.ilike.%${keyword}%`).order('created_at', { ascending: false });
   if (error) { console.error(error); return sendMessage(senderId, "Error searching links."); }
-  if (!data || data.length === 0) return sendMessage(senderId, `No results for "${keyword}".`);
+  if (!data || data.length === 0) return sendMessage(senderId, `No results for "${keyword}" in your saved reviewers.${TAVILY_API_KEY ? ` Try "search ${keyword}" to look it up on the web instead.` : ''}`);
   const list = data.map((l, i) => `${i + 1}. [${l.subject.toUpperCase()}] ${l.url} (${formatDate(l.created_at)})`).join('\n');
   return sendMessage(senderId, `🔍 Results for "${keyword}":\n${list}`);
 }
@@ -551,7 +613,7 @@ async function listProjectLinks(senderId, projectRaw) {
   const { data, error } = await supabase.from('projects').select('id, url, summary, added_by, created_at').eq('project_name', project).order('created_at', { ascending: true });
   if (error) { console.error(error); return sendMessage(senderId, "Error fetching project links."); }
   if (!data || data.length === 0) return sendMessage(senderId, `No links found for project "${project}" yet.`);
-  lastProjectBySender[senderId] = project;
+  await setLastProject(senderId, project);
   const list = data.map((l, i) => `${i + 1}. ${l.url} (${formatDate(l.created_at)}${l.added_by ? `, by ${l.added_by}` : ''})${l.summary ? `\n   — ${l.summary}` : ''}`).join('\n');
   return sendMessage(senderId, `🗂️ ${project.toUpperCase()} project links:\n${list}`);
 }
@@ -561,7 +623,7 @@ async function addProjectLink(senderId, projectRaw, url) {
   const { data: existingRows, error: fetchError } = await supabase.from('projects').select('id, url').eq('project_name', project);
   if (fetchError) { console.error(fetchError); return sendMessage(senderId, "Error checking existing project links."); }
   const exactDupe = existingRows?.find(r => r.url === url);
-  if (exactDupe) { lastProjectBySender[senderId] = project; return sendMessage(senderId, `⚠️ That exact link is already saved under project "${project}".`); }
+  if (exactDupe) { await setLastProject(senderId, project); return sendMessage(senderId, `⚠️ That exact link is already saved under project "${project}".`); }
 
   let summary = null;
   if (GROQ_API_KEY) summary = await summarizeUrl(url);
@@ -569,7 +631,7 @@ async function addProjectLink(senderId, projectRaw, url) {
 
   const { error } = await supabase.from('projects').insert({ project_name: project, url, summary, added_by: addedBy });
   if (error) { console.error(error); return sendMessage(senderId, "Error saving project link."); }
-  lastProjectBySender[senderId] = project;
+  await setLastProject(senderId, project);
   return sendMessage(senderId, `✅ Added to project "${project}" by ${addedBy}.${summary ? `\n📝 ${summary}` : ''}`);
 }
 
@@ -615,18 +677,18 @@ async function listAllProjects(senderId) {
 
 // ---------- REMINDERS ----------
 
-async function addReminder(senderId, description, dueDate) {
-  const { error } = await supabase.from('reminders').insert({ description, due_date: dueDate });
+async function addReminder(senderId, description, dueDate, recurring = 'none') {
+  const { error } = await supabase.from('reminders').insert({ description, due_date: dueDate, recurring });
   if (error) { console.error(error); return sendMessage(senderId, "Error saving reminder."); }
-  return sendMessage(senderId, `⏰ Reminder set: "${description}" on ${dueDate}.`);
+  return sendMessage(senderId, `⏰ Reminder set: "${description}" on ${dueDate}.${recurring !== 'none' ? ` (repeats ${recurring})` : ''}`);
 }
 
 async function listReminders(senderId) {
   const todayStr = getPHTime().toISOString().split('T')[0];
-  const { data, error } = await supabase.from('reminders').select('id, description, due_date').gte('due_date', todayStr).order('due_date', { ascending: true });
+  const { data, error } = await supabase.from('reminders').select('id, description, due_date, recurring').gte('due_date', todayStr).order('due_date', { ascending: true });
   if (error) { console.error(error); return sendMessage(senderId, "Error fetching reminders."); }
   if (!data || data.length === 0) return sendMessage(senderId, "No upcoming reminders.");
-  const list = data.map((r, i) => `${i + 1}. ${r.description} — ${r.due_date}`).join('\n');
+  const list = data.map((r, i) => `${i + 1}. ${r.description} — ${r.due_date}${r.recurring && r.recurring !== 'none' ? ` (repeats ${r.recurring})` : ''}`).join('\n');
   return sendMessage(senderId, `⏰ Upcoming reminders:\n${list}`);
 }
 
@@ -634,9 +696,12 @@ async function listReminders(senderId) {
 
 async function addTodo(senderId, task) {
   const addedBy = await getProfileName(senderId);
-  const { error } = await supabase.from('todos').insert({ task: `${task} (added by ${addedBy})` });
+  const assignMatch = task.match(/@(\w+)/);
+  const cleanTask = task.replace(/@\w+/, '').trim();
+  const assignSuffix = assignMatch ? `, assigned to @${assignMatch[1]}` : '';
+  const { error } = await supabase.from('todos').insert({ task: `${cleanTask} (added by ${addedBy}${assignSuffix})` });
   if (error) { console.error(error); return sendMessage(senderId, "Error adding task."); }
-  return sendMessage(senderId, `✅ Added to to-do list: "${task}"`);
+  return sendMessage(senderId, `✅ Added to to-do list: "${cleanTask}"${assignMatch ? ` (assigned to @${assignMatch[1]})` : ''}`);
 }
 
 async function listTodos(senderId) {
@@ -704,12 +769,13 @@ async function handleImage(imageUrl, senderId) {
   if (!GROQ_API_KEY) {
     return sendMessage(senderId, "I can see you sent an image, but image recognition isn't set up right now.");
   }
-  await sendMessage(senderId, "🖼️ Looking at that...");
+  if (!(await checkAndIncrementUsage(senderId))) return sendMessage(senderId, "⚠️ You've hit today's AI usage limit. Try again tomorrow!");
+  await sendTypingOn(senderId);
 
   const result = await analyzeImage(imageUrl);
   if (!result) return sendMessage(senderId, "I couldn't quite make sense of that image.");
 
-  lastImageBySender[senderId] = { url: imageUrl, summary: result.content };
+  await setLastImage(senderId, { url: imageUrl, summary: result.content });
 
   if (result.type === 'question') {
     await sendMessage(senderId, `📝 Found a question! Let me work on it...`);
@@ -775,9 +841,13 @@ async function handleMessage(text, senderId) {
 
   if (lower === 'help' || lower === '/help') return sendHelp(senderId);
 
-  // Catch feature/capability/identity questions deterministically — don't let the LLM classifier guess
+  // Catch feature/capability/identity questions deterministically — don't let the LLM classifier guess,
+  // but reply conversationally (via Groq) instead of dumping the raw command list.
   if (/\bfeatur|what (can|do) you do|\bcommands?\b|\bcapabilit|what (are|is) you|who are you|what('| i)?s this bot|what bot is this/.test(lower)) {
-    return sendHelp(senderId);
+    if (!GROQ_API_KEY) return sendHelp(senderId);
+    const chatText = await chatReply(trimmed, senderId);
+    addToHistory(senderId, 'assistant', chatText);
+    return sendMessage(senderId, `${chatText}\n\n(Type "help" anytime for the full command list.)`);
   }
 
   if (lower === 'reviewers') return listAllReviewers(senderId);
@@ -793,7 +863,8 @@ async function handleMessage(text, senderId) {
     const query = trimmed.slice(7).trim();
     if (!query) return sendMessage(senderId, "Usage: search <query>");
     if (!TAVILY_API_KEY) return sendMessage(senderId, "Web search isn't set up right now (missing TAVILY_API_KEY).");
-    await sendMessage(senderId, "🌐 Searching...");
+    if (!(await checkAndIncrementUsage(senderId))) return sendMessage(senderId, "⚠️ You've hit today's AI usage limit. Try again tomorrow!");
+    await sendTypingOn(senderId);
     const answer = await answerWithWebSearch(query, senderId);
     addToHistory(senderId, 'assistant', answer);
     return sendMessage(senderId, `🌐 ${answer}`);
@@ -814,16 +885,17 @@ async function handleMessage(text, senderId) {
   if (lower.startsWith('remind ')) {
     const rest = trimmed.slice(7).trim();
     if (!GROQ_API_KEY) return sendMessage(senderId, "Reminder parsing needs AI, which isn't set up right now.");
-    const { description, due_date } = await parseReminder(rest);
+    const { description, due_date, recurring } = await parseReminder(rest);
     if (!description || !due_date) return sendMessage(senderId, "Couldn't figure out the description/date. Try: remind nstp project july 20");
-    return addReminder(senderId, description, due_date);
+    return addReminder(senderId, description, due_date, recurring);
   }
 
   if (lower.startsWith('explain ')) {
     const topic = trimmed.slice(8).trim();
     if (!topic) return sendMessage(senderId, "Usage: explain <topic>");
     if (!GROQ_API_KEY) return sendMessage(senderId, "Explain feature isn't set up right now.");
-    await sendMessage(senderId, "📖 Let me explain that...");
+    if (!(await checkAndIncrementUsage(senderId))) return sendMessage(senderId, "⚠️ You've hit today's AI usage limit. Try again tomorrow!");
+    await sendTypingOn(senderId);
     const explanation = await explainTopic(topic);
     addToHistory(senderId, 'assistant', explanation);
     return sendMessage(senderId, `📖 ${explanation}`);
@@ -833,14 +905,15 @@ async function handleMessage(text, senderId) {
     const subject = words[1]?.toLowerCase();
     if (!subject) return sendMessage(senderId, "Usage: flashcards <subject>");
     if (!GROQ_API_KEY) return sendMessage(senderId, "Flashcards feature isn't set up right now.");
-    await sendMessage(senderId, "🃏 Making flashcards...");
+    if (!(await checkAndIncrementUsage(senderId))) return sendMessage(senderId, "⚠️ You've hit today's AI usage limit. Try again tomorrow!");
+    await sendTypingOn(senderId);
     const cards = await generateFlashcards(subject);
     return sendMessage(senderId, `🃏 Flashcards — ${subject.toUpperCase()}:\n${cards}`);
   }
 
   if (lower.startsWith('save that as ') || lower.startsWith('save as ')) {
     const subject = lower.startsWith('save that as ') ? trimmed.slice(13).trim().toLowerCase() : trimmed.slice(8).trim().toLowerCase();
-    const lastImg = lastImageBySender[senderId];
+    const lastImg = await getLastImage(senderId);
     if (!lastImg) return sendMessage(senderId, "I don't have a recent image to save. Send one first.");
     await addLink(senderId, subject, lastImg.url, { summary: lastImg.summary, autoSummarize: false, skipSimilarCheck: true });
     return;
@@ -863,7 +936,8 @@ async function handleMessage(text, senderId) {
     const subject = words[1]?.toLowerCase();
     if (!subject) return sendMessage(senderId, "Usage: quiz <subject>");
     if (!GROQ_API_KEY) return sendMessage(senderId, "Quiz feature isn't set up right now.");
-    await sendMessage(senderId, "🤔 Generating a few practice questions...");
+    if (!(await checkAndIncrementUsage(senderId))) return sendMessage(senderId, "⚠️ You've hit today's AI usage limit. Try again tomorrow!");
+    await sendTypingOn(senderId);
     const quiz = await generateQuiz(subject);
     return sendMessage(senderId, `📝 Quick practice — ${subject.toUpperCase()}:\n${quiz}`);
   }
@@ -902,7 +976,7 @@ async function handleMessage(text, senderId) {
       return removeProjectByNumber(senderId, restWords[0].toLowerCase(), parseInt(restWords[1], 10));
     }
     const number = parseInt(restWords[0], 10);
-    const project = lastProjectBySender[senderId];
+    const project = await getLastProject(senderId);
     if (!project) return sendMessage(senderId, "Try 'project <name>' first, or use 'removeproject <name> <number>'.");
     if (!number) return sendMessage(senderId, "Usage: removeproject <number> OR removeproject <name> <number>");
     return removeProjectByNumber(senderId, project, number);
@@ -914,7 +988,7 @@ async function handleMessage(text, senderId) {
       return removeByNumber(senderId, restWords[0].toLowerCase(), parseInt(restWords[1], 10));
     }
     const number = parseInt(restWords[0], 10);
-    const subject = lastSubjectBySender[senderId];
+    const subject = await getLastSubject(senderId);
     if (!subject) return sendMessage(senderId, "Try 'reviewer <subject>' first, or use 'remove <subject> <number>'.");
     if (!number) return sendMessage(senderId, "Usage: remove <number> OR remove <subject> <number>");
     return removeByNumber(senderId, subject, number);
@@ -935,7 +1009,7 @@ async function handleMessage(text, senderId) {
   const bareUrlMatch = trimmed.match(/^https?:\/\/\S+$/);
   if (bareUrlMatch && GROQ_API_KEY) {
     const url = bareUrlMatch[0];
-    await sendMessage(senderId, "🤖 Let me figure out where this goes...");
+    await sendTypingOn(senderId);
     const { subject, summary } = await guessSubjectAndSummary(url);
     return addLink(senderId, subject, url, { summary, autoSummarize: false });
   }
@@ -949,7 +1023,7 @@ async function handleMessage(text, senderId) {
       case 'list_recent': return listRecent(senderId);
       case 'find': if (parsed.keyword) return findLinks(senderId, parsed.keyword); break;
       case 'remove': {
-        const subj = parsed.subject?.toLowerCase() || lastSubjectBySender[senderId];
+        const subj = parsed.subject?.toLowerCase() || await getLastSubject(senderId);
         if (subj && parsed.number) return removeByNumber(senderId, subj, parsed.number);
         break;
       }
@@ -972,21 +1046,22 @@ async function handleMessage(text, senderId) {
       case 'list_reminders': return listReminders(senderId);
       case 'save_last_image': {
         const subject = parsed.subject?.toLowerCase();
-        const lastImg = lastImageBySender[senderId];
-        if (!subject || !lastImg) break;
+        const lastImg = await getLastImage(senderId);
         await addLink(senderId, subject, lastImg.url, { summary: lastImg.summary, autoSummarize: false, skipSimilarCheck: true });
         return;
       }
       case 'web_search': {
         if (!parsed.query) break;
         if (!TAVILY_API_KEY) return sendMessage(senderId, "Web search isn't set up right now (missing TAVILY_API_KEY).");
-        await sendMessage(senderId, "🌐 Searching...");
+        if (!(await checkAndIncrementUsage(senderId))) return sendMessage(senderId, "⚠️ You've hit today's AI usage limit. Try again tomorrow!");
+        await sendTypingOn(senderId);
         const answer = await answerWithWebSearch(parsed.query, senderId);
         addToHistory(senderId, 'assistant', answer);
         return sendMessage(senderId, `🌐 ${answer}`);
       }
       case 'chat':
       default: {
+        if (!(await checkAndIncrementUsage(senderId))) return sendMessage(senderId, "⚠️ You've hit today's AI usage limit. Try again tomorrow!");
         const chatText = await chatReply(trimmed, senderId);
         addToHistory(senderId, 'assistant', chatText);
         return sendMessage(senderId, chatText);
@@ -1002,6 +1077,14 @@ async function sendMessage(recipientId, text) {
     await axios.post(`https://graph.facebook.com/v21.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`, { recipient: { id: recipientId }, message: { text } });
   } catch (err) {
     console.error('Send error:', err.response?.data || err.message);
+  }
+}
+
+async function sendTypingOn(recipientId) {
+  try {
+    await axios.post(`https://graph.facebook.com/v21.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`, { recipient: { id: recipientId }, sender_action: 'typing_on' });
+  } catch (err) {
+    console.error('Typing indicator error:', err.response?.data || err.message);
   }
 }
 
