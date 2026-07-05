@@ -7,6 +7,7 @@ app.use(express.json());
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 const lastSubjectBySender = {};
@@ -163,10 +164,64 @@ async function parseReminder(text) {
   }
 }
 
+// ---------- WEB SEARCH (Tavily API) ----------
+
+async function webSearch(query) {
+  if (!TAVILY_API_KEY) return null;
+  try {
+    const res = await axios.post(
+      'https://api.tavily.com/search',
+      {
+        api_key: TAVILY_API_KEY,
+        query,
+        search_depth: 'basic',
+        include_answer: true,
+        max_results: 5,
+      },
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+    const data = res.data;
+    const results = [];
+
+    if (data.answer) {
+      results.push({ title: 'Tavily Answer', snippet: data.answer, link: '' });
+    }
+    if (data.results) {
+      for (const item of data.results.slice(0, 5)) {
+        results.push({ title: item.title, snippet: item.content || '', link: item.url });
+      }
+    }
+    return results;
+  } catch (err) {
+    console.error('Web search error:', err.response?.data || err.message);
+    return null;
+  }
+}
+
+async function answerWithWebSearch(query, senderId) {
+  const results = await webSearch(query);
+  if (!results || results.length === 0) {
+    return "I couldn't find anything on the web for that right now.";
+  }
+  const context = results
+    .map((r, i) => `[${i + 1}] ${r.title}\n${r.snippet}\nSource: ${r.link}`)
+    .join('\n\n');
+
+  const history = getHistory(senderId);
+  const raw = await askGroq(
+    `You are a helpful assistant answering using live web search results provided below. Summarize the answer clearly and concisely (3-6 sentences) in your own words for a Philippine BSN nursing student on Messenger. Mention the source name briefly if relevant (e.g. "according to X"). Do not quote text verbatim — paraphrase. If the results don't actually answer the question, say so honestly.\n\nWeb search results:\n${context}`,
+    query,
+    history
+  );
+  return raw || "I found some results but couldn't summarize them right now.";
+}
+
+// ---------- NATURAL LANGUAGE ROUTING ----------
+
 async function interpretNaturalLanguage(text, senderId) {
   const history = getHistory(senderId);
   const raw = await askGroq(
-    `You control a bot with these real features: reviewer links by subject, project links by project name, a daily class schedule (checkable + automatic alerts), a quiz generator, flashcards, topic explanations, deadline reminders, weather check, a shared to-do list, and image analysis (send a photo of notes/diagrams/questions). Map the message to ONE action as JSON only:
+    `You control a bot with these real features: reviewer links by subject, project links by project name, a daily class schedule (checkable + automatic alerts), a quiz generator, flashcards, topic explanations, deadline reminders, weather check, a shared to-do list, image analysis (send a photo of notes/diagrams/questions), and live web search for current information not in your own knowledge. Map the message to ONE action as JSON only:
 {"action":"list_links","subject":"<subject>"}
 {"action":"list_subjects"}
 {"action":"list_all"}
@@ -183,8 +238,9 @@ async function interpretNaturalLanguage(text, senderId) {
 {"action":"add_todo","task":"<task>"}
 {"action":"list_reminders"}
 {"action":"save_last_image","subject":"<subject>"}
+{"action":"web_search","query":"<search query>"}
 {"action":"chat"}
-Use "save_last_image" if the user says something like "save that as <subject>" referring to a recently sent image. Use "chat" for casual conversation, questions about features, or anything else.`,
+Use "save_last_image" if the user says something like "save that as <subject>" referring to a recently sent image. Use "web_search" for questions about current events, news, facts you may not know, prices, real-world lookups, or anything requiring up-to-date information from the internet. Use "chat" for casual conversation, questions about the bot's own features, or anything else.`,
     text, history
   );
   try {
@@ -196,7 +252,7 @@ Use "save_last_image" if the user says something like "save that as <subject>" r
 
 const BOT_FEATURES_DESCRIPTION = `
 Real features (only mention these, don't invent others):
-1. Reviewer links by subject. 2. Project links by project name. 3. Daily class schedule (checkable + automatic alerts). 4. Quiz generator ("quiz <subject>"). 5. Flashcards ("flashcards <subject>"). 6. Topic explanations ("explain <topic>"). 7. Deadline reminders ("remind <description> <date>", "reminders" to list). 8. Weather check ("weather"). 9. Shared to-do list ("todo <task>", "todos", "done <number>"). 10. Image analysis — send a photo and it identifies if it's study notes, a diagram, a schedule, or a question, and responds accordingly (transcribes notes, answers questions, etc). 11. Normal conversation with memory.
+1. Reviewer links by subject. 2. Project links by project name. 3. Daily class schedule (checkable + automatic alerts). 4. Quiz generator ("quiz <subject>"). 5. Flashcards ("flashcards <subject>"). 6. Topic explanations ("explain <topic>"). 7. Deadline reminders ("remind <description> <date>", "reminders" to list). 8. Weather check ("weather"). 9. Shared to-do list ("todo <task>", "todos", "done <number>"). 10. Image analysis — send a photo and it identifies if it's study notes, a diagram, a schedule, or a question, and responds accordingly (transcribes notes, answers questions, etc). 11. Web search for current info ("search <query>", or just ask a factual/current-events question). 12. Normal conversation with memory.
 `;
 
 async function chatReply(text, senderId) {
@@ -698,6 +754,8 @@ function sendHelp(senderId) {
 
 🖼️ IMAGES: just send a photo — I'll identify notes, diagrams, schedules, or questions (and answer them!)
 
+🌐 WEB SEARCH: search <query>, or just ask about current events/facts — I'll look it up live
+
 🌤️ weather
 
 📦 export — dump everything
@@ -716,6 +774,12 @@ async function handleMessage(text, senderId) {
   addToHistory(senderId, 'user', trimmed);
 
   if (lower === 'help' || lower === '/help') return sendHelp(senderId);
+
+  // Catch feature/capability/identity questions deterministically — don't let the LLM classifier guess
+  if (/\bfeatur|what (can|do) you do|\bcommands?\b|\bcapabilit|what (are|is) you|who are you|what('| i)?s this bot|what bot is this/.test(lower)) {
+    return sendHelp(senderId);
+  }
+
   if (lower === 'reviewers') return listAllReviewers(senderId);
   if (lower === 'recent') return listRecent(senderId);
   if (lower === 'projects') return listProjectNames(senderId);
@@ -724,6 +788,16 @@ async function handleMessage(text, senderId) {
   if (lower === 'todos') return listTodos(senderId);
   if (lower === 'weather') { const w = await getWeather(); addToHistory(senderId, 'assistant', w); return sendMessage(senderId, w); }
   if (lower === 'export') return exportAll(senderId);
+
+  if (lower.startsWith('search ')) {
+    const query = trimmed.slice(7).trim();
+    if (!query) return sendMessage(senderId, "Usage: search <query>");
+    if (!TAVILY_API_KEY) return sendMessage(senderId, "Web search isn't set up right now (missing TAVILY_API_KEY).");
+    await sendMessage(senderId, "🌐 Searching...");
+    const answer = await answerWithWebSearch(query, senderId);
+    addToHistory(senderId, 'assistant', answer);
+    return sendMessage(senderId, `🌐 ${answer}`);
+  }
 
   if (lower.startsWith('done ')) {
     const number = parseInt(words[1], 10);
@@ -902,6 +976,14 @@ async function handleMessage(text, senderId) {
         if (!subject || !lastImg) break;
         await addLink(senderId, subject, lastImg.url, { summary: lastImg.summary, autoSummarize: false, skipSimilarCheck: true });
         return;
+      }
+      case 'web_search': {
+        if (!parsed.query) break;
+        if (!TAVILY_API_KEY) return sendMessage(senderId, "Web search isn't set up right now (missing TAVILY_API_KEY).");
+        await sendMessage(senderId, "🌐 Searching...");
+        const answer = await answerWithWebSearch(parsed.query, senderId);
+        addToHistory(senderId, 'assistant', answer);
+        return sendMessage(senderId, `🌐 ${answer}`);
       }
       case 'chat':
       default: {
