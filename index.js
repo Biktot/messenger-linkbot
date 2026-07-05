@@ -11,10 +11,10 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 const lastSubjectBySender = {};
 const lastProjectBySender = {};
+const lastImageBySender = {};
 const conversationHistory = {};
 const MAX_HISTORY_MESSAGES = 10;
 
-// Masinloc, Zambales approx coordinates
 const LAT = 15.5333;
 const LON = 119.9333;
 
@@ -43,7 +43,7 @@ async function getProfileName(psid) {
   }
 }
 
-// ---------- GROQ HELPERS ----------
+// ---------- GROQ TEXT HELPERS ----------
 
 async function askGroq(systemPrompt, userMessage, history = []) {
   if (!GROQ_API_KEY) return null;
@@ -57,6 +57,35 @@ async function askGroq(systemPrompt, userMessage, history = []) {
     return response.data.choices?.[0]?.message?.content?.trim() || null;
   } catch (err) {
     console.error('Groq error:', err.response?.data || err.message);
+    return null;
+  }
+}
+
+// ---------- GROQ VISION HELPER ----------
+
+async function askGroqVision(prompt, imageUrl) {
+  if (!GROQ_API_KEY) return null;
+  try {
+    const response = await axios.post(
+      'https://api.groq.com/openai/v1/chat/completions',
+      {
+        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: prompt },
+              { type: 'image_url', image_url: { url: imageUrl } },
+            ],
+          },
+        ],
+        max_tokens: 600,
+      },
+      { headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' } }
+    );
+    return response.data.choices?.[0]?.message?.content?.trim() || null;
+  } catch (err) {
+    console.error('Vision error:', err.response?.data || err.message);
     return null;
   }
 }
@@ -113,6 +142,14 @@ async function explainTopic(topic) {
   return raw || "Couldn't generate an explanation right now.";
 }
 
+async function answerQuestions(questionsText) {
+  const raw = await askGroq(
+    'You are a nursing school tutor. Answer each of the following question(s) clearly and concisely, one at a time. If multiple choice, give the correct answer and a brief explanation. If open-ended, give a solid concise answer appropriate for a BSN nursing student.',
+    questionsText
+  );
+  return raw || "I couldn't generate answers for that.";
+}
+
 async function parseReminder(text) {
   const today = getPHTime().toISOString().split('T')[0];
   const raw = await askGroq(
@@ -129,7 +166,7 @@ async function parseReminder(text) {
 async function interpretNaturalLanguage(text, senderId) {
   const history = getHistory(senderId);
   const raw = await askGroq(
-    `You control a bot with these real features: reviewer links by subject, project links by project name, a daily class schedule (checkable + automatic alerts), a quiz generator, flashcards, topic explanations, deadline reminders, weather check, and a shared to-do list. Map the message to ONE action as JSON only:
+    `You control a bot with these real features: reviewer links by subject, project links by project name, a daily class schedule (checkable + automatic alerts), a quiz generator, flashcards, topic explanations, deadline reminders, weather check, a shared to-do list, and image analysis (send a photo of notes/diagrams/questions). Map the message to ONE action as JSON only:
 {"action":"list_links","subject":"<subject>"}
 {"action":"list_subjects"}
 {"action":"list_all"}
@@ -145,8 +182,9 @@ async function interpretNaturalLanguage(text, senderId) {
 {"action":"list_todos"}
 {"action":"add_todo","task":"<task>"}
 {"action":"list_reminders"}
+{"action":"save_last_image","subject":"<subject>"}
 {"action":"chat"}
-Use "chat" for casual conversation, questions about features, or anything else.`,
+Use "save_last_image" if the user says something like "save that as <subject>" referring to a recently sent image. Use "chat" for casual conversation, questions about features, or anything else.`,
     text, history
   );
   try {
@@ -158,7 +196,7 @@ Use "chat" for casual conversation, questions about features, or anything else.`
 
 const BOT_FEATURES_DESCRIPTION = `
 Real features (only mention these, don't invent others):
-1. Reviewer links by subject. 2. Project links by project name. 3. Daily class schedule (checkable + automatic alerts). 4. Quiz generator ("quiz <subject>"). 5. Flashcards ("flashcards <subject>"). 6. Topic explanations ("explain <topic>"). 7. Deadline reminders ("remind <description> <date>", "reminders" to list). 8. Weather check ("weather"). 9. Shared to-do list ("todo <task>", "todos", "done <number>"). 10. Normal conversation with memory.
+1. Reviewer links by subject. 2. Project links by project name. 3. Daily class schedule (checkable + automatic alerts). 4. Quiz generator ("quiz <subject>"). 5. Flashcards ("flashcards <subject>"). 6. Topic explanations ("explain <topic>"). 7. Deadline reminders ("remind <description> <date>", "reminders" to list). 8. Weather check ("weather"). 9. Shared to-do list ("todo <task>", "todos", "done <number>"). 10. Image analysis — send a photo and it identifies if it's study notes, a diagram, a schedule, or a question, and responds accordingly (transcribes notes, answers questions, etc). 11. Normal conversation with memory.
 `;
 
 async function chatReply(text, senderId) {
@@ -254,7 +292,12 @@ app.post('/webhook', async (req, res) => {
   if (body.object === 'page') {
     for (const entry of body.entry) {
       const event = entry.messaging?.[0];
-      if (event?.message?.text) await handleMessage(event.message.text, event.sender.id);
+      if (event?.message?.text) {
+        await handleMessage(event.message.text, event.sender.id);
+      } else if (event?.message?.attachments) {
+        const imageAttachment = event.message.attachments.find(a => a.type === 'image');
+        if (imageAttachment) await handleImage(imageAttachment.payload.url, event.sender.id);
+      }
     }
   }
   res.status(200).send('EVENT_RECEIVED');
@@ -278,7 +321,6 @@ app.get('/cron/morning-brief', async (req, res) => {
     }
     for (const psid of recipients) await sendMessage(psid, messageText);
 
-    // Also check reminders due today/tomorrow, once per day
     const todayStr = phTime.toISOString().split('T')[0];
     const lastCheck = await getLastReminderCheckDate();
     if (lastCheck !== todayStr) {
@@ -573,6 +615,69 @@ async function exportAll(senderId) {
   return sendMessage(senderId, output);
 }
 
+// ---------- IMAGE ANALYSIS ----------
+
+async function analyzeImage(imageUrl) {
+  const raw = await askGroqVision(
+    `Analyze this image and respond with ONLY this format, no extra text:
+TYPE: <one of: reviewer_notes, diagram, schedule, question, random, other>
+SUBJECT: <if it looks like a specific nursing subject like anaphy/biochem/nstp/tfn, name it; otherwise "unknown">
+CONTENT: <see rules below>
+
+Rules for CONTENT based on TYPE:
+- reviewer_notes: transcribe/summarize the key points in 2-4 sentences
+- diagram: describe what it shows
+- schedule: summarize the schedule/document
+- question: transcribe the exact question(s) or questionnaire items shown, verbatim, each on its own line
+- random/other: describe the image in 1-2 sentences`,
+    imageUrl
+  );
+  if (!raw) return null;
+  const typeMatch = raw.match(/TYPE:\s*(.+)/i);
+  const subjectMatch = raw.match(/SUBJECT:\s*(.+)/i);
+  const contentMatch = raw.match(/CONTENT:\s*([\s\S]+)/i);
+  return {
+    type: typeMatch ? typeMatch[1].trim().toLowerCase() : 'other',
+    subject: subjectMatch ? subjectMatch[1].trim().toLowerCase() : 'unknown',
+    content: contentMatch ? contentMatch[1].trim() : '',
+  };
+}
+
+async function handleImage(imageUrl, senderId) {
+  await addRecipient(senderId);
+  if (!GROQ_API_KEY) {
+    return sendMessage(senderId, "I can see you sent an image, but image recognition isn't set up right now.");
+  }
+  await sendMessage(senderId, "🖼️ Looking at that...");
+
+  const result = await analyzeImage(imageUrl);
+  if (!result) return sendMessage(senderId, "I couldn't quite make sense of that image.");
+
+  lastImageBySender[senderId] = { url: imageUrl, summary: result.content };
+
+  if (result.type === 'question') {
+    await sendMessage(senderId, `📝 Found a question! Let me work on it...`);
+    const answers = await answerQuestions(result.content);
+    return sendMessage(senderId, `📝 Question(s) detected:\n${result.content}\n\n✅ Answer(s):\n${answers}`);
+  }
+
+  if (result.type === 'reviewer_notes') {
+    const subject = result.subject !== 'unknown' ? result.subject : 'misc';
+    await addLink(senderId, subject, imageUrl, { summary: result.content, autoSummarize: false, skipSimilarCheck: true });
+    return sendMessage(senderId, `📸 Looks like study notes! I've saved it under "${subject}" with a summary:\n📝 ${result.content}`);
+  }
+
+  if (result.type === 'diagram') {
+    return sendMessage(senderId, `📊 This looks like a diagram:\n${result.content}\n\nWant me to save it as a reviewer under a subject? Just say "save that as <subject>".`);
+  }
+
+  if (result.type === 'schedule') {
+    return sendMessage(senderId, `🗓️ This looks like a schedule/document:\n${result.content}`);
+  }
+
+  return sendMessage(senderId, `🖼️ ${result.content}`);
+}
+
 // ---------- HELP ----------
 
 function sendHelp(senderId) {
@@ -590,6 +695,8 @@ function sendHelp(senderId) {
 ✅ TO-DO: todo <task>, todos, done <number>
 
 📖 STUDY: quiz <subject>, flashcards <subject>, explain <topic>
+
+🖼️ IMAGES: just send a photo — I'll identify notes, diagrams, schedules, or questions (and answer them!)
 
 🌤️ weather
 
@@ -655,6 +762,14 @@ async function handleMessage(text, senderId) {
     await sendMessage(senderId, "🃏 Making flashcards...");
     const cards = await generateFlashcards(subject);
     return sendMessage(senderId, `🃏 Flashcards — ${subject.toUpperCase()}:\n${cards}`);
+  }
+
+  if (lower.startsWith('save that as ') || lower.startsWith('save as ')) {
+    const subject = lower.startsWith('save that as ') ? trimmed.slice(13).trim().toLowerCase() : trimmed.slice(8).trim().toLowerCase();
+    const lastImg = lastImageBySender[senderId];
+    if (!lastImg) return sendMessage(senderId, "I don't have a recent image to save. Send one first.");
+    await addLink(senderId, subject, lastImg.url, { summary: lastImg.summary, autoSummarize: false, skipSimilarCheck: true });
+    return;
   }
 
   if (lower.startsWith('find ')) {
@@ -781,6 +896,13 @@ async function handleMessage(text, senderId) {
       case 'list_todos': return listTodos(senderId);
       case 'add_todo': if (parsed.task) return addTodo(senderId, parsed.task); break;
       case 'list_reminders': return listReminders(senderId);
+      case 'save_last_image': {
+        const subject = parsed.subject?.toLowerCase();
+        const lastImg = lastImageBySender[senderId];
+        if (!subject || !lastImg) break;
+        await addLink(senderId, subject, lastImg.url, { summary: lastImg.summary, autoSummarize: false, skipSimilarCheck: true });
+        return;
+      }
       case 'chat':
       default: {
         const chatText = await chatReply(trimmed, senderId);
