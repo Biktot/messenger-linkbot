@@ -357,6 +357,18 @@ function getTimeString(phDate) {
   return `${h}:${m}`;
 }
 
+// Converts a stored 24-hour "HH:MM" time into a display-friendly 12-hour "H:MM AM/PM" string.
+// Storage stays 24-hour (correct for sorting/math); this is purely for what users see in messages.
+function formatTime12h(time24) {
+  if (!time24) return time24;
+  const [hStr, mStr] = time24.split(':');
+  let h = parseInt(hStr, 10);
+  const period = h >= 12 ? 'PM' : 'AM';
+  h = h % 12;
+  if (h === 0) h = 12;
+  return `${h}:${mStr} ${period}`;
+}
+
 async function checkScheduleFor(when) {
   const phTime = getPHTime();
   const targetDate = new Date(phTime);
@@ -365,7 +377,7 @@ async function checkScheduleFor(when) {
   if (day === 'MON' || day === 'SUN') return `No classes ${when} (${day === 'MON' ? 'No pasok' : 'Sunday'}).`;
   const { data, error } = await supabase.from('schedule').select('subject, start_time, end_time').eq('day', day).order('start_time', { ascending: true });
   if (error || !data || data.length === 0) return `No classes scheduled ${when}.`;
-  const list = data.map(p => `• ${p.subject} (${p.start_time}–${p.end_time})`).join('\n');
+  const list = data.map(p => `• ${p.subject} (${formatTime12h(p.start_time)}–${formatTime12h(p.end_time)})`).join('\n');
   return `📅 Schedule for ${when} (${day}):\n${list}`;
 }
 
@@ -415,47 +427,80 @@ app.post('/webhook', async (req, res) => {
 
 // ---------- CRON ENDPOINTS ----------
 
-app.get('/cron/morning-brief', async (req, res) => {
-  try {
-    const phTime = getPHTime();
-    const day = getDayCode(phTime);
-    const recipients = await getAllRecipients();
-    if (recipients.length === 0) return res.status(200).send('No recipients yet.');
+async function runMorningBrief() {
+  const phTime = getPHTime();
+  const day = getDayCode(phTime);
+  const recipients = await getAllRecipients();
+  if (recipients.length === 0) return 'No recipients yet.';
 
-    let messageText;
-    if (day === 'MON' || day === 'SUN') {
-      messageText = `☀️ Good morning! No classes today. Rest well!`;
-    } else {
-      const { data } = await supabase.from('schedule').select('subject, start_time').eq('day', day).order('start_time', { ascending: true }).limit(1);
-      messageText = (data && data.length > 0) ? `☀️ Good morning! Your first class today is ${data[0].subject} at ${data[0].start_time}.` : `☀️ Good morning! No classes scheduled today.`;
-    }
-    for (const psid of recipients) await sendMessage(psid, messageText);
+  let messageText;
+  if (day === 'MON' || day === 'SUN') {
+    messageText = `☀️ Good morning! No classes today. Rest well!`;
+  } else {
+    const { data } = await supabase.from('schedule').select('subject, start_time').eq('day', day).order('start_time', { ascending: true }).limit(1);
+    messageText = (data && data.length > 0) ? `☀️ Good morning! Your first class today is ${data[0].subject} at ${formatTime12h(data[0].start_time)}.` : `☀️ Good morning! No classes scheduled today.`;
+  }
+  for (const psid of recipients) await sendMessage(psid, messageText);
 
-    const todayStr = phTime.toISOString().split('T')[0];
-    const lastCheck = await getLastReminderCheckDate();
-    if (lastCheck !== todayStr) {
-      const tomorrow = new Date(phTime);
-      tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
-      const tomorrowStr = tomorrow.toISOString().split('T')[0];
+  const todayStr = phTime.toISOString().split('T')[0];
+  const lastCheck = await getLastReminderCheckDate();
+  if (lastCheck !== todayStr) {
+    const tomorrow = new Date(phTime);
+    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+    const tomorrowStr = tomorrow.toISOString().split('T')[0];
 
-      const { data: dueReminders } = await supabase.from('reminders').select('id, description, due_date, recurring').in('due_date', [todayStr, tomorrowStr]);
-      if (dueReminders && dueReminders.length > 0) {
-        for (const r of dueReminders) {
-          const when = r.due_date === todayStr ? 'TODAY' : 'TOMORROW';
-          for (const psid of recipients) await sendMessage(psid, `⏰ Reminder: "${r.description}" is due ${when} (${r.due_date}).`);
+    const { data: dueReminders } = await supabase.from('reminders').select('id, description, due_date, recurring').in('due_date', [todayStr, tomorrowStr]);
+    if (dueReminders && dueReminders.length > 0) {
+      for (const r of dueReminders) {
+        const when = r.due_date === todayStr ? 'TODAY' : 'TOMORROW';
+        for (const psid of recipients) await sendMessage(psid, `⏰ Reminder: "${r.description}" is due ${when} (${r.due_date}).`);
 
-          // Push recurring reminders forward once their due date arrives, instead of letting them go stale
-          if (r.due_date === todayStr && r.recurring && r.recurring !== 'none') {
-            const next = new Date(phTime);
-            next.setUTCDate(next.getUTCDate() + (r.recurring === 'weekly' ? 7 : 30));
-            const nextStr = next.toISOString().split('T')[0];
-            await supabase.from('reminders').update({ due_date: nextStr }).eq('id', r.id);
-          }
+        // Push recurring reminders forward once their due date arrives, instead of letting them go stale
+        if (r.due_date === todayStr && r.recurring && r.recurring !== 'none') {
+          const next = new Date(phTime);
+          next.setUTCDate(next.getUTCDate() + (r.recurring === 'weekly' ? 7 : 30));
+          const nextStr = next.toISOString().split('T')[0];
+          await supabase.from('reminders').update({ due_date: nextStr }).eq('id', r.id);
         }
       }
-      await setLastReminderCheckDate(todayStr);
     }
-    res.status(200).send(`Sent to ${recipients.length} recipient(s).`);
+    await setLastReminderCheckDate(todayStr);
+  }
+  return `Sent to ${recipients.length} recipient(s).`;
+}
+
+async function runCheckSchedule() {
+  const phTime = getPHTime();
+  const day = getDayCode(phTime);
+  const currentTime = getTimeString(phTime);
+  const recipients = await getAllRecipients();
+  if (recipients.length === 0) return 'No recipients yet.';
+  if (day === 'MON' || day === 'SUN') return 'No class day.';
+
+  const { data } = await supabase.from('schedule').select('subject, start_time, end_time').eq('day', day).order('start_time', { ascending: true });
+  if (!data) return 'No schedule.';
+
+  const nowMinutes = parseInt(currentTime.split(':')[0]) * 60 + parseInt(currentTime.split(':')[1]);
+  for (const period of data) {
+    const [sh, sm] = period.start_time.split(':').map(Number);
+    const startMinutes = sh * 60 + sm;
+    const diff = nowMinutes - startMinutes;
+    if (diff >= 0 && diff < 15) {
+      const periodKey = `${day}-${period.start_time}`;
+      const lastNotified = await getLastNotifiedPeriod();
+      if (lastNotified !== periodKey) {
+        for (const psid of recipients) await sendMessage(psid, `📚 ${period.subject} is starting now (${formatTime12h(period.start_time)} - ${formatTime12h(period.end_time)}).`);
+        await setLastNotifiedPeriod(periodKey);
+      }
+    }
+  }
+  return 'Checked.';
+}
+
+app.get('/cron/morning-brief', async (req, res) => {
+  try {
+    const result = await runMorningBrief();
+    res.status(200).send(result);
   } catch (err) {
     console.error('Morning brief error:', err);
     res.status(500).send('Error');
@@ -464,31 +509,8 @@ app.get('/cron/morning-brief', async (req, res) => {
 
 app.get('/cron/check-schedule', async (req, res) => {
   try {
-    const phTime = getPHTime();
-    const day = getDayCode(phTime);
-    const currentTime = getTimeString(phTime);
-    const recipients = await getAllRecipients();
-    if (recipients.length === 0) return res.status(200).send('No recipients yet.');
-    if (day === 'MON' || day === 'SUN') return res.status(200).send('No class day.');
-
-    const { data } = await supabase.from('schedule').select('subject, start_time, end_time').eq('day', day).order('start_time', { ascending: true });
-    if (!data) return res.status(200).send('No schedule.');
-
-    const nowMinutes = parseInt(currentTime.split(':')[0]) * 60 + parseInt(currentTime.split(':')[1]);
-    for (const period of data) {
-      const [sh, sm] = period.start_time.split(':').map(Number);
-      const startMinutes = sh * 60 + sm;
-      const diff = nowMinutes - startMinutes;
-      if (diff >= 0 && diff < 15) {
-        const periodKey = `${day}-${period.start_time}`;
-        const lastNotified = await getLastNotifiedPeriod();
-        if (lastNotified !== periodKey) {
-          for (const psid of recipients) await sendMessage(psid, `📚 ${period.subject} is starting now (${period.start_time} - ${period.end_time}).`);
-          await setLastNotifiedPeriod(periodKey);
-        }
-      }
-    }
-    res.status(200).send('Checked.');
+    const result = await runCheckSchedule();
+    res.status(200).send(result);
   } catch (err) {
     console.error('Check-schedule error:', err);
     res.status(500).send('Error');
@@ -1143,4 +1165,61 @@ async function sendTypingOn(recipientId) {
 }
 
 app.get('/', (req, res) => res.send('Bot is running'));
-app.listen(process.env.PORT || 3000, () => console.log('Server started'));
+
+// ---------- INTERNAL SCHEDULER (replaces need for external cron-job.org triggers) ----------
+//
+// Runs entirely inside this Node process using PH time. The /cron/* HTTP endpoints above are
+// kept as a manual-trigger fallback (e.g. for testing via browser), but are no longer required
+// for normal operation.
+//
+// IMPORTANT: this only works while the process is awake. On Render's free tier the service
+// sleeps after ~15 min of no incoming HTTP traffic, which would silently stop this scheduler too.
+// The self-ping below hits this same service's own URL every 10 minutes specifically to prevent
+// that — as long as SELF_URL (or Render's auto-provided RENDER_EXTERNAL_URL) is set correctly,
+// the app keeps itself perpetually awake without needing cron-job.org at all.
+
+let lastMorningBriefDate = null; // in-process guard against double-firing within the same minute
+
+async function schedulerTick() {
+  try {
+    await runCheckSchedule();
+  } catch (err) {
+    console.error('Internal scheduler (check-schedule) error:', err);
+  }
+
+  try {
+    const phTime = getPHTime();
+    const hh = phTime.getUTCHours();
+    const mm = phTime.getUTCMinutes();
+    const todayStr = phTime.toISOString().split('T')[0];
+    // Fires once, at 06:00 PH time, per calendar day
+    if (hh === 6 && mm === 0 && lastMorningBriefDate !== todayStr) {
+      lastMorningBriefDate = todayStr;
+      await runMorningBrief();
+    }
+  } catch (err) {
+    console.error('Internal scheduler (morning-brief) error:', err);
+  }
+}
+
+const SELF_URL = process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || null;
+
+async function selfPing() {
+  if (!SELF_URL) return;
+  try {
+    await axios.get(SELF_URL, { timeout: 10000 });
+  } catch (err) {
+    console.error('Self-ping error:', err.message);
+  }
+}
+
+app.listen(process.env.PORT || 3000, () => {
+  console.log('Server started');
+  setInterval(schedulerTick, 60 * 1000); // check every minute
+  if (SELF_URL) {
+    setInterval(selfPing, 10 * 60 * 1000); // keep-alive ping every 10 min
+    console.log(`Self-ping enabled: ${SELF_URL}`);
+  } else {
+    console.log('Self-ping disabled: set SELF_URL env var to enable (e.g. https://messenger-linkbot.onrender.com)');
+  }
+});
