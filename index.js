@@ -916,6 +916,19 @@ async function handleMessage(text, senderId) {
 
   if (lower === 'help' || lower === '/help') return sendHelp(senderId);
 
+  // Catch questions about notification mechanics deterministically — this is a question about
+  // HOW/WHEN the bot notifies, not a request to see the schedule itself. Answer with hardcoded
+  // facts about the actual mechanism rather than letting the AI guess or misroute to check_schedule.
+  if (/when (will|do|does|did).*(notify|notified)|what time.*(notify|notified)|(notify|notified|notification|alert).*(when|what time)|when.*(notify|notification|alert)|how.*(notify|notification|alert).*work/.test(lower)) {
+    return sendMessage(senderId,
+      `🔔 Here's how notifications work:\n\n` +
+      `☀️ Morning brief — every day at 6:00 AM (Philippine time), I send your first class of the day plus any reminders due today/tomorrow.\n\n` +
+      `📚 Class-start alerts — I check every minute, and message you within the first 15 minutes after each class period begins (based on your saved schedule).\n\n` +
+      `Both only fire on days you actually have classes — Sundays and Mondays are skipped since there's no pasok.\n\n` +
+      `Want to see today's or tomorrow's actual schedule? Just ask "schedule today" or "schedule tomorrow".`
+    );
+  }
+
   // Catch feature/capability/identity questions deterministically — don't let the LLM classifier guess,
   // but reply conversationally (via Groq) instead of dumping the raw command list.
   if (/\bfeatur|what (can|do) you do|\bcommands?\b|\bcapabilit|what (are|is) you|who are you|what('| i)?s this bot|what bot is this/.test(lower)) {
