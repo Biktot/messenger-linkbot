@@ -150,11 +150,47 @@ async function fetchPageTitle(url) {
   }
 }
 
-async function guessSubjectAndSummary(url) {
+// Attempts to fetch the ACTUAL text content of a Google Docs link (not just the page title),
+// using Google's plain-text export endpoint. This only works if the doc's sharing is set to
+// "Anyone with the link can view" — if it's restricted, Google returns a sign-in page instead,
+// which we detect and treat as a failure (falling back to title-only guessing).
+// This is the real fix for subject-guessing being wrong: previously the AI was only ever shown
+// a page title (often blank/generic for Docs), never the document's real content.
+async function fetchGoogleDocText(url) {
+  const match = url.match(/docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]+)/);
+  if (!match) return null;
+  const docId = match[1];
+  const exportUrl = `https://docs.google.com/document/d/${docId}/export?format=txt`;
+  try {
+    const res = await axios.get(exportUrl, { timeout: 6000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const text = typeof res.data === 'string' ? res.data : '';
+    // If sharing isn't public, Google redirects to a sign-in page instead of the doc's text —
+    // detect that case and treat it as "couldn't read the doc" rather than feeding garbage to the AI.
+    if (!text || text.length < 20 || /accounts\.google\.com|sign in to continue|google account/i.test(text.slice(0, 300))) {
+      return null;
+    }
+    return text.slice(0, 1500); // cap length so we don't blow up the AI prompt on huge docs
+  } catch {
+    return null;
+  }
+}
+
+// Builds the best available context for a URL: real document text when we can get it,
+// otherwise falls back to the page title.
+async function getUrlContext(url) {
+  if (/docs\.google\.com\/document\//.test(url)) {
+    const docText = await fetchGoogleDocText(url);
+    if (docText) return { context: `Actual document content (excerpt):\n${docText}`, readReal: true };
+  }
   const title = await fetchPageTitle(url);
+  return { context: `Page title: ${title || '(unknown — could not read page or document content)'}`, readReal: false };
+}
+
+async function guessSubjectAndSummary(url) {
+  const { context } = await getUrlContext(url);
   const raw = await askGroq(
-    `You sort study reviewer links for a Philippine nursing student. Known subjects: anaphy, biochem, nstp, tfn, philippine history. If unclear, invent a short one-word lowercase tag. Respond with ONLY:\nSUBJECT: <tag>\nSUMMARY: <one short sentence, max 15 words>`,
-    `URL: ${url}\nPage title: ${title || '(unknown)'}`
+    `You sort study reviewer links for a Philippine nursing student. Known subjects: anaphy, biochem, nstp, tfn, understanding_the_self, philippine_history. Base your answer on the ACTUAL CONTENT below whenever it's provided — do not guess a subject unrelated to what the content describes. Only invent a short one-word/underscored lowercase tag if the content genuinely doesn't match a known subject. Respond with ONLY:\nSUBJECT: <tag>\nSUMMARY: <one short sentence, max 15 words>`,
+    `URL: ${url}\n${context}`
   );
   if (!raw) return { subject: 'misc', summary: '' };
   const subjectMatch = raw.match(/SUBJECT:\s*(.+)/i);
@@ -166,8 +202,8 @@ async function guessSubjectAndSummary(url) {
 }
 
 async function summarizeUrl(url) {
-  const title = await fetchPageTitle(url);
-  const raw = await askGroq('Write ONE short sentence (max 15 words) describing what this link likely covers.', `URL: ${url}\nPage title: ${title || '(unknown)'}`);
+  const { context } = await getUrlContext(url);
+  const raw = await askGroq('Write ONE short sentence (max 15 words) describing what this link actually covers, based on the content provided.', `URL: ${url}\n${context}`);
   return raw || '';
 }
 
