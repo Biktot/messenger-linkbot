@@ -369,16 +369,48 @@ function formatTime12h(time24) {
   return `${h}:${mStr} ${period}`;
 }
 
-async function checkScheduleFor(when) {
-  const phTime = getPHTime();
-  const targetDate = new Date(phTime);
-  if (when === 'tomorrow') targetDate.setUTCDate(targetDate.getUTCDate() + 1);
-  const day = getDayCode(targetDate);
-  if (day === 'MON' || day === 'SUN') return `No classes ${when} (${day === 'MON' ? 'No pasok' : 'Sunday'}).`;
+const DAY_NAME_MAP = {
+  sun: 'SUN', sunday: 'SUN',
+  mon: 'MON', monday: 'MON',
+  tue: 'TUE', tues: 'TUE', tuesday: 'TUE',
+  wed: 'WED', weds: 'WED', wednesday: 'WED',
+  thu: 'THU', thur: 'THU', thurs: 'THU', thursday: 'THU',
+  fri: 'FRI', friday: 'FRI',
+  sat: 'SAT', saturday: 'SAT',
+};
+const DAY_LABELS = { SUN: 'Sunday', MON: 'Monday', TUE: 'Tuesday', WED: 'Wednesday', THU: 'Thursday', FRI: 'Friday', SAT: 'Saturday' };
+
+// Parses "today", "tomorrow", or any weekday name/abbreviation (e.g. "tuesday", "tue", "tues")
+// out of free text. Returns { mode: 'today'|'tomorrow'|'day', dayCode } or null if nothing matched.
+function parseScheduleTarget(text) {
+  const lower = text.toLowerCase();
+  if (/\btomorrow\b/.test(lower)) return { mode: 'tomorrow' };
+  if (/\btoday\b/.test(lower)) return { mode: 'today' };
+  for (const [name, code] of Object.entries(DAY_NAME_MAP)) {
+    if (new RegExp(`\\b${name}\\b`).test(lower)) return { mode: 'day', dayCode: code };
+  }
+  return null;
+}
+
+// `target` is either 'today', 'tomorrow', or an explicit day code like 'TUE'.
+async function checkScheduleFor(target) {
+  let day, label;
+  if (target === 'today' || target === 'tomorrow') {
+    const phTime = getPHTime();
+    const targetDate = new Date(phTime);
+    if (target === 'tomorrow') targetDate.setUTCDate(targetDate.getUTCDate() + 1);
+    day = getDayCode(targetDate);
+    label = target;
+  } else {
+    day = target; // already a day code like 'TUE'
+    label = DAY_LABELS[day] || day;
+  }
+
+  if (day === 'MON' || day === 'SUN') return `No classes ${label} (${day === 'MON' ? 'No pasok' : 'Sunday'}).`;
   const { data, error } = await supabase.from('schedule').select('subject, start_time, end_time').eq('day', day).order('start_time', { ascending: true });
-  if (error || !data || data.length === 0) return `No classes scheduled ${when}.`;
+  if (error || !data || data.length === 0) return `No classes scheduled ${label}.`;
   const list = data.map(p => `• ${p.subject} (${formatTime12h(p.start_time)}–${formatTime12h(p.end_time)})`).join('\n');
-  return `📅 Schedule for ${when} (${day}):\n${list}`;
+  return `📅 Schedule for ${label} (${day}):\n${list}`;
 }
 
 async function addRecipient(psid) { await supabase.from('recipients').upsert({ psid }); }
@@ -433,16 +465,25 @@ async function runMorningBrief() {
   const recipients = await getAllRecipients();
   if (recipients.length === 0) return 'No recipients yet.';
 
-  let messageText;
-  if (day === 'MON' || day === 'SUN') {
-    messageText = `☀️ Good morning! No classes today. Rest well!`;
-  } else {
-    const { data } = await supabase.from('schedule').select('subject, start_time').eq('day', day).order('start_time', { ascending: true }).limit(1);
-    messageText = (data && data.length > 0) ? `☀️ Good morning! Your first class today is ${data[0].subject} at ${formatTime12h(data[0].start_time)}.` : `☀️ Good morning! No classes scheduled today.`;
-  }
-  for (const psid of recipients) await sendMessage(psid, messageText);
-
+  // Persistent guard: prevents duplicate "Good morning" greetings if this function gets triggered
+  // more than once on the same day (e.g. both the internal scheduler AND an external cron-job.org
+  // hit fire around 6 AM — this ensures only the first one actually sends the greeting).
   const todayStr = phTime.toISOString().split('T')[0];
+  const { data: alreadySentData } = await supabase.from('bot_state').select('value').eq('key', 'lastMorningGreetingSentDate').maybeSingle();
+  const alreadySentToday = alreadySentData?.value === todayStr;
+
+  if (!alreadySentToday) {
+    let messageText;
+    if (day === 'MON' || day === 'SUN') {
+      messageText = `☀️ Good morning! No classes today. Rest well!`;
+    } else {
+      const { data } = await supabase.from('schedule').select('subject, start_time').eq('day', day).order('start_time', { ascending: true }).limit(1);
+      messageText = (data && data.length > 0) ? `☀️ Good morning! Your first class today is ${data[0].subject} at ${formatTime12h(data[0].start_time)}.` : `☀️ Good morning! No classes scheduled today.`;
+    }
+    for (const psid of recipients) await sendMessage(psid, messageText);
+    await supabase.from('bot_state').upsert({ key: 'lastMorningGreetingSentDate', value: todayStr });
+  }
+
   const lastCheck = await getLastReminderCheckDate();
   if (lastCheck !== todayStr) {
     const tomorrow = new Date(phTime);
@@ -1103,6 +1144,19 @@ async function handleMessage(text, senderId) {
     return addLink(senderId, subject, url, { summary, autoSummarize: false });
   }
 
+  // Catch schedule questions deterministically — any phrasing ("sched for tue", "schedule for
+  // tuesday", "what is my schedule for tuesday", "schedule today/tomorrow") gets parsed directly
+  // instead of relying on the AI classifier, which previously defaulted to "today" for anything
+  // it didn't recognize (e.g. a specific weekday name). Placed after all specific command
+  // prefixes above so it can't hijack things like "todo check schedule with adviser".
+  if (/\bsched(ule)?\b/.test(lower)) {
+    const target = parseScheduleTarget(trimmed);
+    const resolved = target ? (target.mode === 'day' ? target.dayCode : target.mode) : 'today';
+    const r = await checkScheduleFor(resolved);
+    addToHistory(senderId, 'assistant', r);
+    return sendMessage(senderId, r);
+  }
+
   if (GROQ_API_KEY) {
     const parsed = await interpretNaturalLanguage(trimmed, senderId);
     switch (parsed.action) {
@@ -1121,7 +1175,9 @@ async function handleMessage(text, senderId) {
       case 'list_projects': return listProjectNames(senderId);
       case 'add_project': if (parsed.project && parsed.url) return addProjectLink(senderId, parsed.project.toLowerCase(), parsed.url); break;
       case 'check_schedule': {
-        const r = await checkScheduleFor(parsed.when === 'tomorrow' ? 'tomorrow' : 'today');
+        const parsedTarget = parseScheduleTarget(trimmed);
+        const target = parsedTarget ? (parsedTarget.mode === 'day' ? parsedTarget.dayCode : parsedTarget.mode) : (parsed.when === 'tomorrow' ? 'tomorrow' : 'today');
+        const r = await checkScheduleFor(target);
         addToHistory(senderId, 'assistant', r);
         return sendMessage(senderId, r);
       }
