@@ -81,16 +81,15 @@ async function checkAndIncrementUsage(senderId) {
 
 // ---------- PROFILE NAME ----------
 
+// Facebook's profile-fields Graph API endpoint is unreliable for apps in Development mode
+// (frequently fails with error_subcode 33 regardless of permissions), so instead we let each
+// person set their own display name once via a bot command, stored in bot_state.
 async function getProfileName(psid) {
-  try {
-    const res = await axios.get(`https://graph.facebook.com/${psid}`, {
-      params: { fields: 'first_name,last_name', access_token: PAGE_ACCESS_TOKEN },
-    });
-    return `${res.data.first_name || ''} ${res.data.last_name || ''}`.trim() || 'Someone';
-  } catch (err) {
-    console.error('Profile fetch error:', err.response?.data || err.message);
-    return 'Someone';
-  }
+  const { data } = await supabase.from('bot_state').select('value').eq('key', `displayName:${psid}`).maybeSingle();
+  return data?.value || 'Someone';
+}
+async function setDisplayName(psid, name) {
+  await supabase.from('bot_state').upsert({ key: `displayName:${psid}`, value: name });
 }
 
 // ---------- GROQ TEXT HELPERS ----------
@@ -356,25 +355,120 @@ async function chatReply(text, senderId) {
 
 // ---------- WEATHER ----------
 
-async function getWeather() {
+// Looks up any place name via Open-Meteo's free geocoding API (no key needed) — this is what
+// lets "weather in Iba, Zambales" work instead of only ever showing Masinloc.
+async function geocodeLocation(name) {
+  try {
+    const res = await axios.get('https://geocoding-api.open-meteo.com/v1/search', { params: { name, count: 1 } });
+    const r = res.data.results?.[0];
+    if (!r) return null;
+    return { lat: r.latitude, lon: r.longitude, label: `${r.name}${r.admin1 ? ', ' + r.admin1 : ''}` };
+  } catch (err) {
+    console.error('Geocode error:', err.message);
+    return null;
+  }
+}
+
+// dayOffset: null = default bundle (today + tomorrow, for the bare "weather" command, backward
+// compatible with the old behavior). 0 = today, 1 = tomorrow, 2 = day after tomorrow, etc.
+async function getWeatherReport(lat, lon, label, dayOffset) {
   try {
     const res = await axios.get('https://api.open-meteo.com/v1/forecast', {
       params: {
-        latitude: LAT, longitude: LON,
+        latitude: lat, longitude: lon,
         daily: 'precipitation_probability_max,temperature_2m_max,temperature_2m_min',
         timezone: 'Asia/Manila',
+        forecast_days: 8,
       },
     });
     const d = res.data.daily;
-    const todayRain = d.precipitation_probability_max[0];
-    const tomorrowRain = d.precipitation_probability_max[1];
-    const todayHigh = Math.round(d.temperature_2m_max[0]);
-    const todayLow = Math.round(d.temperature_2m_min[0]);
-    return `🌤️ Masinloc weather:\nToday: ${todayLow}°–${todayHigh}°C, ${todayRain}% rain chance\nTomorrow: ${tomorrowRain}% rain chance\n${todayRain > 50 ? '☔ Bring an umbrella today!' : '✅ Low rain chance today.'}`;
+
+    if (dayOffset === null) {
+      const todayRain = d.precipitation_probability_max[0];
+      const tomorrowRain = d.precipitation_probability_max[1];
+      const todayHigh = Math.round(d.temperature_2m_max[0]);
+      const todayLow = Math.round(d.temperature_2m_min[0]);
+      return `🌤️ ${label} weather:\nToday: ${todayLow}°–${todayHigh}°C, ${todayRain}% rain chance\nTomorrow: ${tomorrowRain}% rain chance\n${todayRain > 50 ? '☔ Bring an umbrella today!' : '✅ Low rain chance today.'}`;
+    }
+
+    if (dayOffset >= d.time.length) return `I can only see about a week ahead for ${label} — that day's too far out.`;
+    const rain = d.precipitation_probability_max[dayOffset];
+    const high = Math.round(d.temperature_2m_max[dayOffset]);
+    const low = Math.round(d.temperature_2m_min[dayOffset]);
+    const dayLabel = dayOffset === 0 ? 'Today' : dayOffset === 1 ? 'Tomorrow'
+      : new Date(d.time[dayOffset]).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
+    return `🌤️ ${label} weather — ${dayLabel}:\n${low}°–${high}°C, ${rain}% rain chance\n${rain > 50 ? '☔ Bring an umbrella!' : '✅ Low rain chance.'}`;
   } catch (err) {
     console.error('Weather error:', err.message);
-    return "Couldn't fetch weather right now.";
+    return `Couldn't fetch weather for ${label} right now.`;
   }
+}
+
+// Parses a free-text weather request for a day (today/tomorrow/day-after/weekday name) and an
+// optional location ("weather in Iba, Zambales tomorrow"). Reuses the same prefix-based weekday
+// matching as schedule parsing, so "wednesd", "saturd", etc. work here too.
+function parseWeatherQuery(text) {
+  const lower = text.toLowerCase();
+  let dayOffset = 0;
+  let explicitDay = false;
+
+  if (/\b(day after tomorrow|next day|sa makalawa)\b/.test(lower)) {
+    dayOffset = 2; explicitDay = true;
+  } else if (/\b(tomorrow|tom|tmrw|tmrrw|2mrw)\b/.test(lower)) {
+    dayOffset = 1; explicitDay = true;
+  } else if (/\b(today|2day|tdy)\b/.test(lower)) {
+    dayOffset = 0; explicitDay = true;
+  } else {
+    const words = lower.match(/[a-z]+/g) || [];
+    outer:
+    for (const word of words) {
+      if (word.length < 3) continue;
+      for (const [code, fullName] of Object.entries(FULL_DAY_NAMES)) {
+        if (fullName.startsWith(word)) {
+          const days = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
+          const todayIdx = getPHTime().getUTCDay();
+          const targetIdx = days.indexOf(code);
+          let diff = targetIdx - todayIdx;
+          if (diff < 0) diff += 7;
+          dayOffset = diff;
+          explicitDay = true;
+          break outer;
+        }
+      }
+    }
+  }
+
+  const locMatch = text.match(/\b(?:in|at)\s+([a-zA-Z0-9][a-zA-Z0-9\s,.]*)/i);
+  let location = null;
+  if (locMatch) {
+    location = locMatch[1]
+      .replace(/\b(today|tomorrow|tom|tmrw|day after tomorrow|next day|on \w+)\b.*$/i, '')
+      .replace(/[,.\s]+$/, '')
+      .trim();
+    if (!location) location = null;
+  }
+
+  return { dayOffset, explicitDay, location };
+}
+
+async function handleWeatherRequest(senderId, text) {
+  const { dayOffset, explicitDay, location } = parseWeatherQuery(text);
+  let lat = LAT, lon = LON, label = 'Masinloc';
+
+  if (location) {
+    const geo = await geocodeLocation(location);
+    if (geo) {
+      lat = geo.lat; lon = geo.lon; label = geo.label;
+    } else {
+      await sendMessage(senderId, `Couldn't find "${location}" — showing Masinloc weather instead.`);
+    }
+  }
+
+  // Bare "weather" (no day, no location) keeps the old today+tomorrow bundle for familiarity.
+  const finalOffset = (!explicitDay && !location) ? null : dayOffset;
+  const w = await getWeatherReport(lat, lon, label, finalOffset);
+  addToHistory(senderId, 'assistant', w);
+  return sendMessage(senderId, w);
 }
 
 // ---------- SCHEDULE HELPERS ----------
@@ -405,25 +499,24 @@ function formatTime12h(time24) {
   return `${h}:${mStr} ${period}`;
 }
 
-const DAY_NAME_MAP = {
-  sun: 'SUN', sunday: 'SUN',
-  mon: 'MON', monday: 'MON',
-  tue: 'TUE', tues: 'TUE', tuesday: 'TUE',
-  wed: 'WED', weds: 'WED', wednesday: 'WED',
-  thu: 'THU', thur: 'THU', thurs: 'THU', thursday: 'THU',
-  fri: 'FRI', friday: 'FRI',
-  sat: 'SAT', saturday: 'SAT',
-};
+const FULL_DAY_NAMES = { SUN: 'sunday', MON: 'monday', TUE: 'tuesday', WED: 'wednesday', THU: 'thursday', FRI: 'friday', SAT: 'saturday' };
 const DAY_LABELS = { SUN: 'Sunday', MON: 'Monday', TUE: 'Tuesday', WED: 'Wednesday', THU: 'Thursday', FRI: 'Friday', SAT: 'Saturday' };
 
-// Parses "today", "tomorrow", or any weekday name/abbreviation (e.g. "tuesday", "tue", "tues")
-// out of free text. Returns { mode: 'today'|'tomorrow'|'day', dayCode } or null if nothing matched.
+// Parses "today"/"tomorrow" (with common abbreviations) or any weekday name out of free text.
+// Day-name matching is PREFIX-based rather than a fixed list of aliases: any word of 3+ letters
+// that is a prefix of a real day name matches automatically (e.g. "tuesd", "saturd", "wednesd"),
+// so new typos/truncations don't need a code change to be recognized.
+// Returns { mode: 'today'|'tomorrow'|'day', dayCode } or null if nothing matched.
 function parseScheduleTarget(text) {
   const lower = text.toLowerCase();
-  if (/\btomorrow\b/.test(lower)) return { mode: 'tomorrow' };
-  if (/\btoday\b/.test(lower)) return { mode: 'today' };
-  for (const [name, code] of Object.entries(DAY_NAME_MAP)) {
-    if (new RegExp(`\\b${name}\\b`).test(lower)) return { mode: 'day', dayCode: code };
+  if (/\b(tomorrow|tom|tmrw|tmrrw|2mrw)\b/.test(lower)) return { mode: 'tomorrow' };
+  if (/\b(today|2day|tdy)\b/.test(lower)) return { mode: 'today' };
+  const words = lower.match(/[a-z]+/g) || [];
+  for (const word of words) {
+    if (word.length < 3) continue;
+    for (const [code, fullName] of Object.entries(FULL_DAY_NAMES)) {
+      if (fullName.startsWith(word)) return { mode: 'day', dayCode: code };
+    }
   }
   return null;
 }
@@ -993,6 +1086,13 @@ async function handleMessage(text, senderId) {
 
   if (lower === 'help' || lower === '/help') return sendHelp(senderId);
 
+  if (lower.startsWith('iam ') || lower.startsWith("i'm ") || lower.startsWith('im ')) {
+    const name = trimmed.replace(/^(iam|i'm|im)\s+/i, '').trim();
+    if (!name) return sendMessage(senderId, 'Usage: iam <your name>');
+    await setDisplayName(senderId, name);
+    return sendMessage(senderId, `✅ Got it, I'll call you ${name} from now on.`);
+  }
+
   // Catch questions about notification mechanics deterministically — this is a question about
   // HOW/WHEN the bot notifies, not a request to see the schedule itself. Answer with hardcoded
   // facts about the actual mechanism rather than letting the AI guess or misroute to check_schedule.
@@ -1021,7 +1121,6 @@ async function handleMessage(text, senderId) {
   if (lower === 'allprojects') return listAllProjects(senderId);
   if (lower === 'reminders') return listReminders(senderId);
   if (lower === 'todos') return listTodos(senderId);
-  if (lower === 'weather') { const w = await getWeather(); addToHistory(senderId, 'assistant', w); return sendMessage(senderId, w); }
   if (lower === 'export') return exportAll(senderId);
 
   if (lower.startsWith('search ')) {
@@ -1193,6 +1292,13 @@ async function handleMessage(text, senderId) {
     return sendMessage(senderId, r);
   }
 
+  // Catch weather questions deterministically — same reasoning as schedule above: placed after
+  // all specific command prefixes so it can't hijack things like "todo check weather forecast",
+  // but still catches any phrasing ("weather", "weather tomorrow", "weather in Iba Zambales").
+  if (/\bweather\b/.test(lower)) {
+    return handleWeatherRequest(senderId, trimmed);
+  }
+
   if (GROQ_API_KEY) {
     const parsed = await interpretNaturalLanguage(trimmed, senderId);
     switch (parsed.action) {
@@ -1218,9 +1324,7 @@ async function handleMessage(text, senderId) {
         return sendMessage(senderId, r);
       }
       case 'weather': {
-        const w = await getWeather();
-        addToHistory(senderId, 'assistant', w);
-        return sendMessage(senderId, w);
+        return handleWeatherRequest(senderId, trimmed);
       }
       case 'list_todos': return listTodos(senderId);
       case 'add_todo': if (parsed.task) return addTodo(senderId, parsed.task); break;
